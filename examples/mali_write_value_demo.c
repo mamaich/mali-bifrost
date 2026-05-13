@@ -39,6 +39,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/ioctl.h>
+#include <linux/types.h>
 
 /* ------------------------------------------------------------------ */
 /* Subset of the kbase ABI (from mali_kbase_ioctl.h / mali_base_kernel.h) */
@@ -197,6 +198,9 @@ struct mali_payload_write_value {
 #define PAGE_SHIFT_4K 12
 #define PAGE_SZ_4K    (1u << PAGE_SHIFT_4K)
 
+/* Size of the data buffer the GPU will write into. */
+#define ALLOC_SIZE    0x10000000ull   /* 256 MiB */
+
 static void hex16(const char *tag, const volatile void *p)
 {
 	const volatile uint8_t *b = (const volatile uint8_t *)p;
@@ -242,24 +246,28 @@ static int mali_open_and_handshake(void)
 }
 
 /*
- * Allocate one VA-page (4 KiB) with SAME_VA semantics and mmap() it.
+ * Allocate `size` bytes (rounded up to a multiple of 4 KiB) with SAME_VA
+ * semantics and mmap() the result.
  *
  * On success returns the CPU pointer (which is also the GPU virtual address)
  * and stores the GPU VA in *gpu_va_out.
  */
-static void *mali_alloc_page(int fd, uint64_t *gpu_va_out)
+static void *mali_alloc(int fd, uint64_t size, uint64_t *gpu_va_out)
 {
+	uint64_t va_pages = (size + PAGE_SZ_4K - 1) >> PAGE_SHIFT_4K;
+
 	union kbase_ioctl_mem_alloc a;
 	memset(&a, 0, sizeof(a));
-	a.in.va_pages     = 1;
-	a.in.commit_pages = 1;
+	a.in.va_pages     = va_pages;
+	a.in.commit_pages = va_pages;
 	a.in.extent       = 0;
 	a.in.flags        = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
 	                    BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
 	                    BASE_MEM_SAME_VA;
 
 	if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &a) < 0) {
-		fprintf(stderr, "MEM_ALLOC: %s\n", strerror(errno));
+		fprintf(stderr, "MEM_ALLOC(%llu pages): %s\n",
+			(unsigned long long)va_pages, strerror(errno));
 		return NULL;
 	}
 
@@ -267,11 +275,12 @@ static void *mali_alloc_page(int fd, uint64_t *gpu_va_out)
 	 * fed back to mmap() as the offset; the returned CPU address becomes
 	 * the real, shared CPU/GPU virtual address. */
 	uint64_t cookie = a.out.gpu_va;
-	void *cpu = mmap(NULL, PAGE_SZ_4K, PROT_READ | PROT_WRITE,
-			 MAP_SHARED, fd, (off_t)cookie);
+	void *cpu = mmap(NULL, va_pages << PAGE_SHIFT_4K,
+			 PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)cookie);
 	if (cpu == MAP_FAILED) {
-		fprintf(stderr, "mmap(cookie=%#llx): %s\n",
-			(unsigned long long)cookie, strerror(errno));
+		fprintf(stderr, "mmap(cookie=%#llx, %llu pages): %s\n",
+			(unsigned long long)cookie,
+			(unsigned long long)va_pages, strerror(errno));
 		struct kbase_ioctl_mem_free mf = { .gpu_addr = cookie };
 		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
 		return NULL;
@@ -281,10 +290,11 @@ static void *mali_alloc_page(int fd, uint64_t *gpu_va_out)
 	return cpu;
 }
 
-static void mali_free_page(int fd, void *cpu, uint64_t gpu_va)
+static void mali_free(int fd, void *cpu, uint64_t size, uint64_t gpu_va)
 {
+	uint64_t va_pages = (size + PAGE_SZ_4K - 1) >> PAGE_SHIFT_4K;
 	if (cpu)
-		munmap(cpu, PAGE_SZ_4K);
+		munmap(cpu, va_pages << PAGE_SHIFT_4K);
 	if (gpu_va) {
 		struct kbase_ioctl_mem_free mf = { .gpu_addr = gpu_va };
 		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
@@ -353,20 +363,24 @@ int main(void)
 	if (fd < 0)
 		return 1;
 
-	/* Data page: GPU will write 0x12345678 here. */
+	/* Data buffer: GPU will write 0x12345678 here.  ALLOC_SIZE bytes
+	 * (rounded up to a page) are allocated and committed up-front. */
 	uint64_t data_gpu = 0;
-	void *data = mali_alloc_page(fd, &data_gpu);
+	void *data = mali_alloc(fd, ALLOC_SIZE, &data_gpu);
 	if (!data) { close(fd); return 1; }
+	printf("data: cpu=%p gpu_va=%#llx size=%#llx\n",
+	       data, (unsigned long long)data_gpu,
+	       (unsigned long long)ALLOC_SIZE);
 
 	/* Pre-fill with a recognisable pattern so the BEFORE/AFTER dump is
 	 * unambiguous. */
 	memset(data, 0xAA, 16);
 	hex16("BEFORE", data);
 
-	/* Job descriptor page. */
+	/* Job descriptor — one page is plenty. */
 	uint64_t job_gpu = 0;
-	void *job = mali_alloc_page(fd, &job_gpu);
-	if (!job) { mali_free_page(fd, data, data_gpu); close(fd); return 1; }
+	void *job = mali_alloc(fd, PAGE_SZ_4K, &job_gpu);
+	if (!job) { mali_free(fd, data, ALLOC_SIZE, data_gpu); close(fd); return 1; }
 
 	build_write_value_job(job, data_gpu, 0x12345678u);
 
@@ -376,7 +390,8 @@ int main(void)
 	int rc = mali_submit_and_wait(fd, job_gpu);
 
 	/* Make sure any GPU writes that may have lingered in caches are
-	 * visible to the CPU. */
+	 * visible to the CPU.  We only need to look at the first few bytes
+	 * the GPU touched, so a single-page sync is enough. */
 	struct kbase_ioctl_mem_sync ms = {
 		.handle    = data_gpu,
 		.user_addr = (uintptr_t)data,
@@ -391,8 +406,8 @@ int main(void)
 	printf("result: first u32 = 0x%08x %s\n", v,
 	       v == 0x12345678u ? "[OK]" : "[MISMATCH]");
 
-	mali_free_page(fd, job, job_gpu);
-	mali_free_page(fd, data, data_gpu);
+	mali_free(fd, job, PAGE_SZ_4K, job_gpu);
+	mali_free(fd, data, ALLOC_SIZE, data_gpu);
 	close(fd);
 	return rc;
 }
