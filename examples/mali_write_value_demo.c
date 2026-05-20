@@ -12,9 +12,25 @@
  *   5. wait for completion by read()'ing a base_jd_event_v2 from /dev/mali0;
  *   6. print first 16 bytes again.
  *
- * Build (Android NDK, aarch64):
- *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang \
+ * Build (armv7-a, 32-bit kernel + 32-bit userspace, glibc/musl):
+ *   arm-linux-gnueabihf-gcc -march=armv7-a -mfpu=neon -mthumb \
  *       -Wall -O2 mali_write_value_demo.c -o mali_demo
+ *
+ * Or with the Android NDK for armeabi-v7a:
+ *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi29-clang \
+ *       -Wall -O2 mali_write_value_demo.c -o mali_demo
+ *
+ * 32-bit notes
+ * ------------
+ *  - All kbase ioctl structs use __u32/__u64 explicitly, so their layouts are
+ *    architecture-independent.  base_jd_atom_v2 is 48 bytes, base_jd_event_v2
+ *    is 24 bytes on both armv7 and aarch64.
+ *  - User-space pointers are stored as __u64 in the ABI; we go through
+ *    uintptr_t which is 32-bit on armv7, the cast to uint64_t zero-extends.
+ *    The 32-bit kernel reads them back via u64_to_user_ptr() and just keeps
+ *    the low 32 bits.
+ *  - _FILE_OFFSET_BITS=64 makes glibc route mmap() through mmap2 so the
+ *    cookie offset is passed correctly even on 32-bit ABIs.
  *
  * The program speaks ABI version 11.x (UK 11.13 in this tree).
  *
@@ -29,6 +45,8 @@
  * older numbering still used in some panfrost branches).
  */
 
+#define _FILE_OFFSET_BITS 64
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -39,6 +57,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/ioctl.h>
+#include <linux/types.h>   /* __u16/__u32/__u64 (glibc/musl ARM toolchains) */
 
 /* ------------------------------------------------------------------ */
 /* Subset of the kbase ABI (from mali_kbase_ioctl.h / mali_base_kernel.h) */
