@@ -3,14 +3,18 @@
  *
  * Demonstrates how to:
  *   1. open /dev/mali0 (kbase) on a Bifrost device (S905X2/X3, S922X, A311D);
- *   2. allocate one page of GPU memory and map it into the CPU address space
- *      (BASE_MEM_SAME_VA, so the CPU pointer == GPU VA);
- *   3. print first 16 bytes;
+ *   2. expose a static, page-aligned CPU array Buff[] to the GPU through
+ *      KBASE_IOCTL_MEM_IMPORT (type = USER_BUFFER).  No GPU page is
+ *      allocated for the data — the kernel pins the existing user pages
+ *      and maps them into the GPU MMU for the lifetime of the job;
+ *   3. print first 16 bytes of Buff[];
  *   4. build a WRITE_VALUE job-chain that writes 0x12345678 into the first
- *      4 bytes of that page and submit it to the GPU through
- *      KBASE_IOCTL_JOB_SUBMIT;
+ *      4 bytes of the imported region and submit it to the GPU through
+ *      KBASE_IOCTL_JOB_SUBMIT.  The atom carries BASE_JD_REQ_EXTERNAL_RESOURCES
+ *      so the kernel pins Buff[]'s pages and inserts them in the GPU MMU
+ *      for the duration of the job;
  *   5. wait for completion by read()'ing a base_jd_event_v2 from /dev/mali0;
- *   6. print first 16 bytes again.
+ *   6. print first 16 bytes of Buff[] again.
  *
  * Build (armv7-a, 32-bit kernel + 32-bit userspace, glibc/musl):
  *   arm-linux-gnueabihf-gcc -march=armv7-a -mfpu=neon -mthumb \
@@ -20,17 +24,30 @@
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi29-clang \
  *       -Wall -O2 mali_write_value_demo.c -o mali_demo
  *
- * 32-bit notes
- * ------------
- *  - All kbase ioctl structs use __u32/__u64 explicitly, so their layouts are
- *    architecture-independent.  base_jd_atom_v2 is 48 bytes, base_jd_event_v2
- *    is 24 bytes on both armv7 and aarch64.
- *  - User-space pointers are stored as __u64 in the ABI; we go through
- *    uintptr_t which is 32-bit on armv7, the cast to uint64_t zero-extends.
- *    The 32-bit kernel reads them back via u64_to_user_ptr() and just keeps
- *    the low 32 bits.
- *  - _FILE_OFFSET_BITS=64 makes glibc route mmap() through mmap2 so the
- *    cookie offset is passed correctly even on 32-bit ABIs.
+ * For aarch64 (64-bit kernel + 64-bit userspace):
+ *   aarch64-linux-gnu-gcc -Wall -O2 mali_write_value_demo.c -o mali_demo
+ *
+ * 32-bit vs 64-bit kernel behaviour for KBASE_IOCTL_MEM_IMPORT
+ * ------------------------------------------------------------
+ * In mali_kbase_mem_linux.c:1037 there is a block guarded by
+ *
+ *     #ifdef CONFIG_64BIT
+ *         if (!kbase_ctx_flag(kctx, KCTX_COMPAT))
+ *             shared_zone = true;
+ *     #endif
+ *
+ * On a 64-bit kernel this forces BASE_MEM_NEED_MMAP, so the import returns a
+ * *cookie* in [BASE_MEM_COOKIE_BASE, BASE_MEM_FIRST_FREE_ADDRESS) and the
+ * caller has to mmap() it to get a real CPU/GPU VA.
+ *
+ * On a 32-bit kernel (no CONFIG_64BIT) the block is compiled out: the
+ * driver falls into the "we control the VA, nothing to mmap yet" branch at
+ * line 1487 and returns a *real GPU VA* directly.  Calling mmap() on that
+ * value yields EPERM because the offset doesn't match any cookie.
+ *
+ * mali_import_user_buffer() below detects which case it is at runtime by
+ * looking at the returned value and only mmap()'s when it really is a
+ * cookie.
  *
  * The program speaks ABI version 11.x (UK 11.13 in this tree).
  *
@@ -107,6 +124,30 @@ struct kbase_ioctl_mem_free {
 #define KBASE_IOCTL_MEM_FREE \
 	_IOW(KBASE_IOCTL_TYPE, 7, struct kbase_ioctl_mem_free)
 
+union kbase_ioctl_mem_import {
+	struct {
+		__u64 flags;
+		__u64 phandle;
+		__u32 type;
+		__u32 padding;
+	} in;
+	struct {
+		__u64 flags;
+		__u64 gpu_va;
+		__u64 va_pages;
+	} out;
+};
+#define KBASE_IOCTL_MEM_IMPORT \
+	_IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
+
+/* phandle payload for type = USER_BUFFER */
+struct base_mem_import_user_buffer {
+	__u64 ptr;
+	__u64 length;
+};
+
+#define BASE_MEM_IMPORT_TYPE_USER_BUFFER  3
+
 struct kbase_ioctl_mem_sync {
 	__u64 handle;
 	__u64 user_addr;
@@ -126,12 +167,27 @@ struct kbase_ioctl_mem_sync {
 
 /* special pgoff handle for the "tracking page" that must be mapped first */
 #define BASE_MEM_MAP_TRACKING_HANDLE     (3ull << 12)
-/* cookies returned by MEM_ALLOC live in [BASE_MEM_COOKIE_BASE,FIRST_FREE) */
-#define BASE_MEM_COOKIE_BASE             (64ul << 12)
+/* cookies returned by MEM_ALLOC / MEM_IMPORT live in
+ *   [BASE_MEM_COOKIE_BASE, BASE_MEM_FIRST_FREE_ADDRESS).
+ * BASE_MEM_FIRST_FREE_ADDRESS depends on BITS_PER_LONG of the *kernel*, so
+ * we keep the wider 64-bit upper bound below — anything below it is a
+ * cookie, anything above is already a real GPU VA. */
+#define BASE_MEM_COOKIE_BASE             (64ull << 12)
+#define BASE_MEM_COOKIE_END_MAX          (((64ull) << 12) + BASE_MEM_COOKIE_BASE)
 
 /* core_req bits */
 typedef uint32_t base_jd_core_req;
 #define BASE_JD_REQ_CS                   ((base_jd_core_req)1 << 1)
+#define BASE_JD_REQ_EXTERNAL_RESOURCES   ((base_jd_core_req)1 << 8)
+
+/* base_external_resource: gpu_va | access bit (LSB).
+ *   access == 0 -> shared, 1 -> exclusive (see base_external_resource_init
+ *   in mali_base_kernel.h:1037). */
+struct base_external_resource {
+	uint64_t ext_resource;
+};
+#define BASE_EXT_RES_ACCESS_SHARED       0u
+#define BASE_EXT_RES_ACCESS_EXCLUSIVE    1u
 
 /* atom dependency */
 typedef uint8_t base_atom_id;
@@ -261,6 +317,76 @@ static int mali_open_and_handshake(void)
 }
 
 /*
+ * Import an existing CPU buffer into the GPU address space (type = USER_BUFFER).
+ *
+ * The same ioctl returns two different things depending on the kernel:
+ *   - 64-bit kernel: a cookie that has to be mmap()'d to obtain a real
+ *     CPU/GPU VA (mali_kbase_mem_linux.c:1037 forces BASE_MEM_NEED_MMAP for
+ *     non-compat tasks under #ifdef CONFIG_64BIT);
+ *   - 32-bit kernel: a real GPU VA already, no mmap is possible (that
+ *     #ifdef block does not compile in, so the import falls into the
+ *     "we control the VA, nothing to mmap yet" branch at line 1487).
+ *
+ * Cookies fall inside [BASE_MEM_COOKIE_BASE, BASE_MEM_FIRST_FREE_ADDRESS);
+ * anything outside that range is a real GPU VA we can hand to a job
+ * directly.  CPU access in both cases goes through the original host_ptr
+ * (the kernel only pins the user pages and inserts them in the GPU MMU
+ * when an atom referencing the region as an external resource runs).
+ *
+ * On success returns 0, stores the GPU VA in *gpu_va_out and, if a cookie
+ * mapping was made, stores its CPU base in *cookie_map_out (otherwise NULL).
+ */
+static int mali_import_user_buffer(int fd, void *host_ptr, size_t length,
+				   uint64_t *gpu_va_out,
+				   void **cookie_map_out)
+{
+	struct base_mem_import_user_buffer ub = {
+		.ptr    = (uint64_t)(uintptr_t)host_ptr,
+		.length = length,
+	};
+
+	union kbase_ioctl_mem_import imp;
+	memset(&imp, 0, sizeof(imp));
+	imp.in.flags   = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+	                 BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+	imp.in.phandle = (uint64_t)(uintptr_t)&ub;
+	imp.in.type    = BASE_MEM_IMPORT_TYPE_USER_BUFFER;
+
+	if (ioctl(fd, KBASE_IOCTL_MEM_IMPORT, &imp) < 0) {
+		fprintf(stderr, "MEM_IMPORT: %s\n", strerror(errno));
+		return -1;
+	}
+
+	uint64_t gpu_va   = imp.out.gpu_va;
+	uint64_t va_pages = imp.out.va_pages;
+
+	*cookie_map_out = NULL;
+
+	if (gpu_va >= BASE_MEM_COOKIE_BASE && gpu_va < BASE_MEM_COOKIE_END_MAX) {
+		/* 64-bit-kernel path: it's a cookie, mmap to anchor the region
+		 * to a real GPU virtual address.  The resulting CPU VA is a
+		 * placeholder with no physical pages backing it — do not
+		 * dereference, always access through host_ptr. */
+		void *cm = mmap(NULL, va_pages << PAGE_SHIFT_4K,
+				PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+				(off_t)gpu_va);
+		if (cm == MAP_FAILED) {
+			fprintf(stderr, "mmap(import cookie=%#llx): %s\n",
+				(unsigned long long)gpu_va, strerror(errno));
+			struct kbase_ioctl_mem_free mf = { .gpu_addr = gpu_va };
+			ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
+			return -1;
+		}
+		*gpu_va_out     = (uint64_t)(uintptr_t)cm;
+		*cookie_map_out = cm;
+	} else {
+		/* 32-bit-kernel path: gpu_va is already the real GPU VA. */
+		*gpu_va_out = gpu_va;
+	}
+	return 0;
+}
+
+/*
  * Allocate one VA-page (4 KiB) with SAME_VA semantics and mmap() it.
  *
  * On success returns the CPU pointer (which is also the GPU virtual address)
@@ -334,14 +460,27 @@ static void build_write_value_job(void *job_page, uint64_t target,
 	p->immediate = value;
 }
 
-static int mali_submit_and_wait(int fd, uint64_t jc_gpu_va)
+static int mali_submit_and_wait(int fd, uint64_t jc_gpu_va,
+				uint64_t target_gpu_va)
 {
+	/* The imported region is referenced as an external resource so that
+	 * the kernel pins Buff[]'s pages and inserts them in the GPU MMU for
+	 * the duration of this atom (kbase_jd_pre_external_resources ->
+	 * kbase_map_external_resource -> kbase_jd_user_buf_map). */
+	struct base_external_resource extres = {
+		.ext_resource = (target_gpu_va & ~0xFFFull) |
+		                BASE_EXT_RES_ACCESS_EXCLUSIVE,
+	};
+
 	base_jd_atom_v2 atom;
 	memset(&atom, 0, sizeof(atom));
 	atom.jc              = jc_gpu_va;
+	atom.nr_extres       = 1;
+	atom.extres_list     = (uint64_t)(uintptr_t)&extres;
 	atom.atom_number     = 1;             /* arbitrary, must be unique    */
 	atom.prio            = BASE_JD_PRIO_MEDIUM;
-	atom.core_req        = BASE_JD_REQ_CS; /* vertex/compute/tiler slot 1 */
+	atom.core_req        = BASE_JD_REQ_CS |
+	                       BASE_JD_REQ_EXTERNAL_RESOURCES;
 
 	struct kbase_ioctl_job_submit sub = {
 		.addr     = (uintptr_t)&atom,
@@ -366,52 +505,75 @@ static int mali_submit_and_wait(int fd, uint64_t jc_gpu_va)
 	return ev.event_code == BASE_JD_EVENT_DONE ? 0 : -1;
 }
 
+/*
+ * Static, page-aligned, page-sized array exposed to the GPU as an
+ * imported user buffer.
+ */
+static uint64_t __attribute__((aligned(4096)))
+	Buff[4096 / sizeof(uint64_t)];
+
 int main(void)
 {
 	int fd = mali_open_and_handshake();
 	if (fd < 0)
 		return 1;
 
-	/* Data page: GPU will write 0x12345678 here. */
-	uint64_t data_gpu = 0;
-	void *data = mali_alloc_page(fd, &data_gpu);
-	if (!data) { close(fd); return 1; }
-
 	/* Pre-fill with a recognisable pattern so the BEFORE/AFTER dump is
 	 * unambiguous. */
-	memset(data, 0xAA, 16);
-	hex16("BEFORE", data);
+	memset(Buff, 0xAA, 16);
+	hex16("BEFORE", Buff);
 
-	/* Job descriptor page. */
+	/* Hand Buff[] to the GPU.  The kernel pins these very pages and
+	 * inserts them in the GPU MMU on demand, when the atom that lists
+	 * the region as an external resource starts running. */
+	uint64_t data_gpu = 0;
+	void *import_cookie_map = NULL;
+	if (mali_import_user_buffer(fd, Buff, sizeof(Buff),
+				    &data_gpu, &import_cookie_map) < 0) {
+		close(fd);
+		return 1;
+	}
+	printf("imported Buff[%zu] (cpu=%p) -> gpu_va=%#llx %s\n",
+	       sizeof(Buff), (void *)Buff, (unsigned long long)data_gpu,
+	       import_cookie_map ? "(via cookie mmap)" : "(direct, 32-bit kernel)");
+
+	/* Job descriptor still lives in a normal SAME_VA allocation. */
 	uint64_t job_gpu = 0;
 	void *job = mali_alloc_page(fd, &job_gpu);
-	if (!job) { mali_free_page(fd, data, data_gpu); close(fd); return 1; }
+	if (!job) {
+		if (import_cookie_map)
+			munmap(import_cookie_map, sizeof(Buff));
+		struct kbase_ioctl_mem_free mf = { .gpu_addr = data_gpu };
+		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
+		close(fd);
+		return 1;
+	}
 
 	build_write_value_job(job, data_gpu, 0x12345678u);
 
 	printf("submit: jc=%#llx -> [%#llx] = 0x12345678\n",
 	       (unsigned long long)job_gpu, (unsigned long long)data_gpu);
 
-	int rc = mali_submit_and_wait(fd, job_gpu);
+	int rc = mali_submit_and_wait(fd, job_gpu, data_gpu);
 
-	/* Make sure any GPU writes that may have lingered in caches are
-	 * visible to the CPU. */
-	struct kbase_ioctl_mem_sync ms = {
-		.handle    = data_gpu,
-		.user_addr = (uintptr_t)data,
-		.size      = PAGE_SZ_4K,
-		.type      = 1,            /* sync_from_device (invalidate) */
-	};
-	ioctl(fd, KBASE_IOCTL_MEM_SYNC, &ms);
+	hex16("AFTER ", Buff);
 
-	hex16("AFTER ", data);
-
-	uint32_t v = *(volatile uint32_t *)data;
+	uint32_t v;
+	memcpy(&v, Buff, sizeof(v));
 	printf("result: first u32 = 0x%08x %s\n", v,
 	       v == 0x12345678u ? "[OK]" : "[MISMATCH]");
 
 	mali_free_page(fd, job, job_gpu);
-	mali_free_page(fd, data, data_gpu);
+
+	/* Release the import: drop the optional CPU placeholder mapping and
+	 * ask the kernel to forget about the region.  kbase_mem_free accepts
+	 * either the cookie or the real GPU VA, so passing data_gpu (which is
+	 * the real GPU VA in both 32-bit and 64-bit paths) is correct. */
+	if (import_cookie_map)
+		munmap(import_cookie_map, sizeof(Buff));
+	struct kbase_ioctl_mem_free mf = { .gpu_addr = data_gpu };
+	ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
+
 	close(fd);
 	return rc;
 }
