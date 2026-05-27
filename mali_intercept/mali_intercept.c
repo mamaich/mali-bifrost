@@ -325,8 +325,14 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	 * жить, пока mali не вызовет dma_buf_put в
 	 * kbase_mem_phy_alloc_free для KBASE_MEM_TYPE_IMPORTED_UMM —
 	 * тогда сработает наш phys_dmabuf_release.
+	 *
+	 * Используем replace_fd(fd, NULL, 0): это экспортируемая
+	 * обёртка, которая при NULL-файле делегирует в __close_fd
+	 * (сам __close_fd экспортирован не во всех вендорных ядрах
+	 * Amlogic 4.9; "Unknown symbol __close_fd" при insmod — именно
+	 * это).
 	 */
-	__close_fd(current->files, fd);
+	replace_fd(fd, NULL, 0);
 
 	if (ret < 0)
 		return ret;
