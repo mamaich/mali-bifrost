@@ -228,11 +228,35 @@ static int phys_dmabuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
 			       length, vma->vm_page_prot);
 }
 
+/*
+ * dma_buf_export в ядре 4.9 имеет WARN_ON, требующий, чтобы у ops
+ * были непустые .kmap_atomic, .kmap и .mmap — иначе он возвращает
+ * -EINVAL. Это требование сняли только в 4.19. Мы реально не
+ * поддерживаем CPU-kmap на reserved-memory (нет struct page), но
+ * stub'ы должны существовать. Возвращаем NULL — для kmap это
+ * легальный ответ "не могу замапить", потребитель должен это
+ * корректно обработать. mali_kbase в нашем UMM-пути не зовёт ни
+ * kmap, ни kmap_atomic — он использует только sg_dma_address из
+ * map_dma_buf.
+ */
+static void *phys_dmabuf_kmap_atomic(struct dma_buf *dbuf,
+				     unsigned long page_num)
+{
+	return NULL;
+}
+
+static void *phys_dmabuf_kmap(struct dma_buf *dbuf, unsigned long page_num)
+{
+	return NULL;
+}
+
 static const struct dma_buf_ops phys_dmabuf_ops = {
 	.map_dma_buf   = phys_dmabuf_map,
 	.unmap_dma_buf = phys_dmabuf_unmap,
 	.release       = phys_dmabuf_release,
 	.mmap          = phys_dmabuf_mmap,
+	.kmap_atomic   = phys_dmabuf_kmap_atomic,
+	.kmap          = phys_dmabuf_kmap,
 };
 
 static struct dma_buf *phys_dmabuf_create(phys_addr_t phys, size_t length)
