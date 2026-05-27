@@ -37,10 +37,19 @@
  * @in.flags:      Биты BASE_MEM_* (PROT_GPU_RD/WR и т.д.) — те же,
  *                 что принимает KBASE_IOCTL_MEM_IMPORT.
  *
- * @out.gpu_va:    GPU VA, по которому замаплен буфер.
+ * @out.gpu_va:    Готовый GPU VA, по которому замаплен буфер.
+ *                 В отличие от штатного KBASE_IOCTL_MEM_IMPORT, это
+ *                 НЕ cookie — модуль сам делает mmap(cookie) изнутри
+ *                 ядра через vm_mmap, поэтому пользователю не нужно
+ *                 ничего домапывать. Для 64-битного non-compat
+ *                 вызывающего эта же VA является CPU VA (SAME_VA).
  * @out.va_pages:  Размер маппинга в страницах PAGE_SIZE.
  * @out.flags:     Итоговые флаги, как их выставил mali_kbase
  *                 (может убрать неподдерживаемые биты).
+ *
+ * Очистка:
+ *   munmap(out.gpu_va, out.va_pages * PAGE_SIZE);
+ *   ioctl(fd, KBASE_IOCTL_MEM_FREE, &(struct {__u64 gpu_addr;}){out.gpu_va});
  */
 union mali_intercept_import_phys {
 	struct {

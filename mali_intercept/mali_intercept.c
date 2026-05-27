@@ -97,6 +97,13 @@ union kbase_ioctl_mem_import_local {
 #define KBASE_IOCTL_MEM_IMPORT_LOCAL \
 	_IOWR(KBASE_IOCTL_TYPE_LOCAL, 22, union kbase_ioctl_mem_import_local)
 
+struct kbase_ioctl_mem_free_local {
+	__u64 gpu_addr;
+};
+
+#define KBASE_IOCTL_MEM_FREE_LOCAL \
+	_IOW(KBASE_IOCTL_TYPE_LOCAL, 7, struct kbase_ioctl_mem_free_local)
+
 /*
  * Forward declaration экспортируемых из mali_kbase символов. Используем
  * для модульной зависимости (mali_kbase обязан быть загружен раньше и
@@ -178,10 +185,43 @@ static void phys_dmabuf_release(struct dma_buf *dbuf)
 	kfree(priv);
 }
 
+/*
+ * CPU-сторонний mmap нужен для cookie→gpu_va перехода в kbase_mmap
+ * для UMM-импортов 64-битных задач (BASE_MEM_NEED_MMAP форсируется в
+ * kbase_mem_from_umm). Пользователь обычно не трогает эту память —
+ * её владелец спецдрайвер — но mmap всё равно должен пройти, иначе
+ * у вызвавшего IMPORT_PHYS не будет валидного gpu_va.
+ *
+ * remap_pfn_range кладёт PTE напрямую из PFN, не требуя struct page
+ * (это критично для reserved-memory с pfn_valid()=false). Защита
+ * страниц используется та, что выставил kbase_mmap до dma_buf_mmap.
+ */
+static int phys_dmabuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
+{
+	struct phys_dmabuf_priv *priv = dbuf->priv;
+	size_t length = vma->vm_end - vma->vm_start;
+	unsigned long pfn = (unsigned long)(priv->phys_addr >> PAGE_SHIFT);
+
+	if (vma->vm_pgoff) {
+		pr_warn("mali_intercept: phys_dmabuf mmap vm_pgoff=%lu, поддерживается только 0\n",
+			vma->vm_pgoff);
+		return -EINVAL;
+	}
+	if (length > priv->length) {
+		pr_warn("mali_intercept: phys_dmabuf mmap len=%zu > buf=%zu\n",
+			length, priv->length);
+		return -EINVAL;
+	}
+
+	return remap_pfn_range(vma, vma->vm_start, pfn,
+			       length, vma->vm_page_prot);
+}
+
 static const struct dma_buf_ops phys_dmabuf_ops = {
 	.map_dma_buf   = phys_dmabuf_map,
 	.unmap_dma_buf = phys_dmabuf_unmap,
 	.release       = phys_dmabuf_release,
+	.mmap          = phys_dmabuf_mmap,
 };
 
 static struct dma_buf *phys_dmabuf_create(phys_addr_t phys, size_t length)
@@ -290,7 +330,48 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	if (ret < 0)
 		return ret;
 
-	param.out.gpu_va   = kparam.out.gpu_va;
+	/*
+	 * Для 64-битного non-compat вызывающего kbase_mem_from_umm форсит
+	 * BASE_MEM_NEED_MMAP, и kparam.out.gpu_va — не реальный GPU VA,
+	 * а cookie. Превращение cookie → real gpu_va делается одной
+	 * операцией mmap на наш filp: kbase_mmap по этому cookie
+	 * подхватывает pending_region, отдаёт ему стабильную GPU VA и
+	 * (для UMM) делегирует в dma_buf_mmap нашего phys-dmabuf.
+	 * Так как SAME_VA: real_gpu_va == cpu_va. Делаем эту mmap сразу
+	 * из ядра, чтобы пользователю не пришлось.
+	 *
+	 * vm_mmap кладёт VMA в адресное пространство вызывающего процесса
+	 * (то самое, чей kbase_context лежит в filp->private_data) — это
+	 * именно то, что нам нужно.
+	 */
+	{
+		unsigned long ua;
+		unsigned long map_len =
+			(unsigned long)kparam.out.va_pages << PAGE_SHIFT;
+
+		ua = vm_mmap(filp, 0, map_len,
+			     PROT_READ | PROT_WRITE, MAP_SHARED,
+			     (unsigned long)kparam.out.gpu_va);
+
+		if (IS_ERR_VALUE(ua)) {
+			struct kbase_ioctl_mem_free_local mf;
+
+			mf.gpu_addr = kparam.out.gpu_va;
+			pr_warn("mali_intercept: vm_mmap(cookie=0x%llx, len=%lu) failed: %ld; rollback\n",
+				(unsigned long long)kparam.out.gpu_va,
+				map_len, (long)ua);
+
+			old_fs = get_fs();
+			set_fs(KERNEL_DS);
+			orig_unlocked_ioctl(filp, KBASE_IOCTL_MEM_FREE_LOCAL,
+					    (unsigned long)&mf);
+			set_fs(old_fs);
+
+			return (long)ua;
+		}
+
+		param.out.gpu_va = (u64)ua;
+	}
 	param.out.va_pages = kparam.out.va_pages;
 	param.out.flags    = kparam.out.flags;
 
