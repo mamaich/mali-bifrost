@@ -62,6 +62,7 @@
 #include <linux/delay.h>
 #include <linux/atomic.h>
 #include <linux/uaccess.h>
+#include <linux/mman.h>
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
