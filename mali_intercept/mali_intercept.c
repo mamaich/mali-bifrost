@@ -1,21 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * mali_intercept.c — перехватчик IOCTL устройства /dev/maliN
+ *                    плюс собственный IOCTL для импорта физической
+ *                    памяти из reserved-memory.
  *
- * Подход (без CONFIG_KPROBES):
+ * Часть 1. Перехват IOCTL (без CONFIG_KPROBES):
+ *
  *   1. Через kallsyms_lookup_name() находим адрес статической
  *      file_operations 'kbase_fops' в загруженном модуле mali_kbase.
  *   2. Сохраняем оригинальные указатели .unlocked_ioctl и .compat_ioctl.
- *   3. Через set_memory_rw() делаем страницу с kbase_fops пишимой
- *      (она в .rodata модуля и закрыта на запись, когда ядро собрано
- *      с CONFIG_DEBUG_SET_MODULE_RONX).
- *   4. Подменяем указатели на свои обёртки, которые сначала логируют
- *      IOCTL, потом вызывают оригинальную функцию.
- *   5. Возвращаем страницу в R/O.
+ *   3. Через set_memory_rw() делаем страницу с kbase_fops пишимой.
+ *   4. Подменяем указатели на свои обёртки. Обёртка:
+ *        - если IOCTL имеет наш magic ('M'), идёт в свой диспетчер;
+ *        - иначе логирует IOCTL и делегирует в оригинал.
  *
- * Поскольку мы патчим разделяемую struct file_operations, перехват
- * срабатывает для всех уже открытых и будущих файловых дескрипторов
- * любого /dev/maliN — никакого перехвата на уровне open() не нужно.
+ * Часть 2. IOCTL MALI_INTERCEPT_IOCTL_IMPORT_PHYS:
+ *
+ *   Пользователь передаёт {phys_addr, length, flags}, получает обратно
+ *   {gpu_va, va_pages, flags} — как у штатного KBASE_IOCTL_MEM_IMPORT,
+ *   но источник памяти — физический адрес от стороннего драйвера, а не
+ *   user VA / dma_buf fd.
+ *
+ *   Реализация — гибрид через UMM/dma_buf:
+ *     - оборачиваем физический буфер во временный dma_buf с минимальным
+ *       exporter-ом, который отдаёт sg_table с одним элементом
+ *       (page=NULL, dma_address=phys_addr). mali_kbase в kbase_mem.c
+ *       читает только sg_dma_address(), так что struct page не нужен —
+ *       это важно для reserved-memory, где pfn_valid()=false.
+ *     - получаем для этого dma_buf транзитный fd в таблице вызывающего
+ *       процесса, вызываем оригинальный kbase_ioctl с
+ *       KBASE_IOCTL_MEM_IMPORT type=UMM, после чего fd закрываем —
+ *       kbase уже сделал dma_buf_get() внутри и держит свой ref.
+ *     - так как мы вызываем kbase_ioctl с указателями на kernel-память
+ *       (наш kparam и наш fd-holder), переключаемся в KERNEL_DS на
+ *       время вызова. В 4.9 это штатный приём.
  *
  * Зависимость от mali_kbase создаётся через вызов экспортированной
  * функции kbase_find_device() — это заставляет модульный загрузчик
@@ -23,12 +41,10 @@
  * mali_intercept загружен.
  *
  * Требования к ядру:
- *   - CONFIG_KALLSYMS=y (стандартно для embedded-ядер)
- *   - set_memory_rw/ro экспортированы (на ARM64 в 4.9 — да,
- *     EXPORT_SYMBOL_GPL); если в вендорном ядре экспорта нет —
- *     обнаружится через kallsyms-фоллбэк
- *   - mali_kbase должен быть собран как модуль (его статические
- *     символы попадают в kallsyms только так)
+ *   - CONFIG_KALLSYMS=y
+ *   - CONFIG_DMA_SHARED_BUFFER=y
+ *   - mali_kbase собран как модуль (его static-символы попадают в
+ *     kallsyms только в этом случае)
  *
  * Целевая платформа: ARM64, Linux 4.9.113 (Amlogic Meson G12A/SM1/G12B).
  */
@@ -38,21 +54,54 @@
 #include <linux/init.h>
 #include <linux/kallsyms.h>
 #include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/ioctl.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/delay.h>
 #include <linux/atomic.h>
+#include <linux/uaccess.h>
+#include <linux/dma-buf.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/errno.h>
+
+#include "mali_intercept_uapi.h"
 
 #define TARGET_FOPS_SYMBOL "kbase_fops"
 
 /*
+ * Воспроизведение нужных констант и структур из mali_kbase, чтобы не
+ * подключать всю кучу его заголовков. Эти значения — часть стабильного
+ * ABI mali_kbase r16p0 и должны совпадать с тем, что определено в
+ * mali_kbase_ioctl.h / mali_base_kernel.h.
+ */
+#define KBASE_IOCTL_TYPE_LOCAL          0x80
+#define KBASE_MEM_IMPORT_TYPE_UMM_LOCAL 2 /* enum base_mem_import_type */
+
+union kbase_ioctl_mem_import_local {
+	struct {
+		__u64 flags;
+		__u64 phandle;
+		__u32 type;
+		__u32 padding;
+	} in;
+	struct {
+		__u64 flags;
+		__u64 gpu_va;
+		__u64 va_pages;
+	} out;
+};
+
+#define KBASE_IOCTL_MEM_IMPORT_LOCAL \
+	_IOWR(KBASE_IOCTL_TYPE_LOCAL, 22, union kbase_ioctl_mem_import_local)
+
+/*
  * Forward declaration экспортируемых из mali_kbase символов. Используем
- * их единственно для того, чтобы создать модульную зависимость:
- * mali_intercept нельзя загрузить без mali_kbase, и mali_kbase нельзя
- * выгрузить пока mali_intercept жив. Сами функции дают нам ещё и
- * sanity-check: убедиться, что mali_kbase действительно
- * проинициализировался хотя бы для одного /dev/maliN.
+ * для модульной зависимости (mali_kbase обязан быть загружен раньше и
+ * не может быть выгружен пока жив mali_intercept) и для проверки, что
+ * хотя бы один /dev/maliN зарегистрирован.
  */
 struct kbase_device;
 extern struct kbase_device *kbase_find_device(int minor);
@@ -63,21 +112,216 @@ static struct file_operations *target_fops;
 static long (*orig_unlocked_ioctl)(struct file *, unsigned int, unsigned long);
 static long (*orig_compat_ioctl)(struct file *, unsigned int, unsigned long);
 
-/*
- * set_memory_rw/ro ищем через kallsyms, чтобы не залипать на
- * EXPORT_SYMBOL_GPL: в стоковом v4.9.113 они есть, но вендорное
- * ядро Amlogic могло их выпилить.
- */
 typedef int (*set_memory_attr_fn)(unsigned long addr, int numpages);
 static set_memory_attr_fn set_memory_rw_fn;
 static set_memory_attr_fn set_memory_ro_fn;
 
-/*
- * Счётчик потоков, находящихся сейчас внутри наших обёрток.
- * Нужен для безопасной выгрузки: после восстановления указателей
- * ждём, пока не выйдут все, кто успел зайти по старому указателю.
- */
 static atomic_t in_wrapper = ATOMIC_INIT(0);
+
+/* =========================================================== */
+/* dma_buf exporter для физического (reserved-memory) буфера   */
+/* =========================================================== */
+
+struct phys_dmabuf_priv {
+	phys_addr_t phys_addr;
+	size_t length;
+};
+
+static struct sg_table *phys_dmabuf_map(struct dma_buf_attachment *attach,
+					enum dma_data_direction dir)
+{
+	struct phys_dmabuf_priv *priv = attach->dmabuf->priv;
+	struct sg_table *sgt;
+	int ret;
+
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+
+	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
+	if (ret) {
+		kfree(sgt);
+		return ERR_PTR(ret);
+	}
+
+	/*
+	 * mali_kbase читает только sg_dma_address()/sg_dma_len() в
+	 * kbase_mem.c — см. цикл for_each_sg вокруг 3529. struct page
+	 * не нужен. NULL допустим: sg_assign_page проверяет только
+	 * выравнивание адреса страницы на 4 (NULL == 0 — пройдёт).
+	 *
+	 * Спецдрайвер сам делает cache maintenance, поэтому dma_map_sg
+	 * нам не нужен. На платформе без SMMU между CPU и Mali GPU видят
+	 * один и тот же физический адрес — отдаём его напрямую.
+	 */
+	sg_set_page(sgt->sgl, NULL, priv->length, 0);
+	sg_dma_address(sgt->sgl) = priv->phys_addr;
+	sg_dma_len(sgt->sgl) = priv->length;
+
+	return sgt;
+}
+
+static void phys_dmabuf_unmap(struct dma_buf_attachment *attach,
+			      struct sg_table *sgt,
+			      enum dma_data_direction dir)
+{
+	sg_free_table(sgt);
+	kfree(sgt);
+}
+
+static void phys_dmabuf_release(struct dma_buf *dbuf)
+{
+	struct phys_dmabuf_priv *priv = dbuf->priv;
+
+	pr_debug("mali_intercept: phys_dmabuf release phys=0x%llx len=%zu\n",
+		 (unsigned long long)priv->phys_addr, priv->length);
+	kfree(priv);
+}
+
+static const struct dma_buf_ops phys_dmabuf_ops = {
+	.map_dma_buf   = phys_dmabuf_map,
+	.unmap_dma_buf = phys_dmabuf_unmap,
+	.release       = phys_dmabuf_release,
+};
+
+static struct dma_buf *phys_dmabuf_create(phys_addr_t phys, size_t length)
+{
+	struct phys_dmabuf_priv *priv;
+	struct dma_buf *dbuf;
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return ERR_PTR(-ENOMEM);
+
+	priv->phys_addr = phys;
+	priv->length = length;
+
+	exp_info.ops   = &phys_dmabuf_ops;
+	exp_info.size  = length;
+	exp_info.flags = O_RDWR;
+	exp_info.priv  = priv;
+
+	dbuf = dma_buf_export(&exp_info);
+	if (IS_ERR(dbuf)) {
+		kfree(priv);
+		return dbuf;
+	}
+
+	return dbuf;
+}
+
+/* =========================================================== */
+/* Обработчик MALI_INTERCEPT_IOCTL_IMPORT_PHYS                 */
+/* =========================================================== */
+
+static long handle_import_phys(struct file *filp, unsigned long arg)
+{
+	union mali_intercept_import_phys param;
+	union kbase_ioctl_mem_import_local kparam;
+	struct dma_buf *dbuf;
+	int fd, holder_fd;
+	long ret;
+	mm_segment_t old_fs;
+
+	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
+		return -EFAULT;
+
+	if (!param.in.length)
+		return -EINVAL;
+	if (param.in.phys_addr & ~PAGE_MASK)
+		return -EINVAL;
+	if (param.in.length & ~PAGE_MASK)
+		return -EINVAL;
+
+	pr_info("mali_intercept: IMPORT_PHYS pid=%d phys=0x%llx len=0x%llx flags=0x%llx\n",
+		current->pid,
+		(unsigned long long)param.in.phys_addr,
+		(unsigned long long)param.in.length,
+		(unsigned long long)param.in.flags);
+
+	dbuf = phys_dmabuf_create((phys_addr_t)param.in.phys_addr,
+				  (size_t)param.in.length);
+	if (IS_ERR(dbuf))
+		return PTR_ERR(dbuf);
+
+	/*
+	 * Получаем транзитный fd в таблице дескрипторов вызывающего
+	 * процесса. Он нужен, потому что mali kbase_mem_from_umm()
+	 * использует dma_buf_get(fd) → fget(fd), что ищет file в
+	 * current->files. Альтернативного пути через struct dma_buf *
+	 * в public API mali_kbase нет.
+	 */
+	fd = dma_buf_fd(dbuf, O_CLOEXEC);
+	if (fd < 0) {
+		dma_buf_put(dbuf);
+		return fd;
+	}
+
+	holder_fd = fd;
+	kparam.in.flags   = param.in.flags;
+	kparam.in.phandle = (u64)(uintptr_t)&holder_fd;
+	kparam.in.type    = KBASE_MEM_IMPORT_TYPE_UMM_LOCAL;
+	kparam.in.padding = 0;
+
+	/*
+	 * kbase_ioctl делает copy_from_user/copy_to_user относительно
+	 * uarg и get_user(fd, phandle). Мы передаём kernel-указатели
+	 * (&kparam и &holder_fd) — на время вызова переключаемся в
+	 * KERNEL_DS, чтобы access_ok пропустил, а копирование
+	 * вырождалось в memcpy. В 4.9 этот механизм ещё штатный.
+	 */
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+	ret = orig_unlocked_ioctl(filp, KBASE_IOCTL_MEM_IMPORT_LOCAL,
+				  (unsigned long)&kparam);
+	set_fs(old_fs);
+
+	/*
+	 * Закрываем транзитный fd сразу. kbase_mem_from_umm() уже сделал
+	 * dma_buf_get → fget внутри, увеличив refcount нашего dma_buf
+	 * (точнее, его подложного struct file). Сам dma_buf останется
+	 * жить, пока mali не вызовет dma_buf_put в
+	 * kbase_mem_phy_alloc_free для KBASE_MEM_TYPE_IMPORTED_UMM —
+	 * тогда сработает наш phys_dmabuf_release.
+	 */
+	__close_fd(current->files, fd);
+
+	if (ret < 0)
+		return ret;
+
+	param.out.gpu_va   = kparam.out.gpu_va;
+	param.out.va_pages = kparam.out.va_pages;
+	param.out.flags    = kparam.out.flags;
+
+	if (copy_to_user((void __user *)arg, &param, sizeof(param)))
+		return -EFAULT;
+
+	pr_info("mali_intercept: IMPORT_PHYS OK pid=%d -> gpu_va=0x%llx va_pages=%llu flags=0x%llx\n",
+		current->pid,
+		(unsigned long long)param.out.gpu_va,
+		(unsigned long long)param.out.va_pages,
+		(unsigned long long)param.out.flags);
+
+	return 0;
+}
+
+static long mali_intercept_dispatch(struct file *filp, unsigned int cmd,
+				    unsigned long arg)
+{
+	switch (cmd) {
+	case MALI_INTERCEPT_IOCTL_IMPORT_PHYS:
+		return handle_import_phys(filp, arg);
+	default:
+		pr_warn("mali_intercept: unknown intercept IOCTL nr=%u\n",
+			_IOC_NR(cmd));
+		return -ENOTTY;
+	}
+}
+
+/* =========================================================== */
+/* ioctl wrappers                                              */
+/* =========================================================== */
 
 static inline void log_ioctl(const char *tag, unsigned int cmd)
 {
@@ -94,9 +338,15 @@ static long wrapper_unlocked_ioctl(struct file *filp, unsigned int cmd,
 	long ret;
 
 	atomic_inc(&in_wrapper);
-	log_ioctl("unlocked", cmd);
-	ret = orig_unlocked_ioctl ?
-		orig_unlocked_ioctl(filp, cmd, arg) : -ENOTTY;
+
+	if (_IOC_TYPE(cmd) == MALI_INTERCEPT_IOCTL_TYPE) {
+		ret = mali_intercept_dispatch(filp, cmd, arg);
+	} else {
+		log_ioctl("unlocked", cmd);
+		ret = orig_unlocked_ioctl ?
+			orig_unlocked_ioctl(filp, cmd, arg) : -ENOTTY;
+	}
+
 	atomic_dec(&in_wrapper);
 	return ret;
 }
@@ -107,19 +357,23 @@ static long wrapper_compat_ioctl(struct file *filp, unsigned int cmd,
 	long ret;
 
 	atomic_inc(&in_wrapper);
-	log_ioctl("compat  ", cmd);
-	ret = orig_compat_ioctl ?
-		orig_compat_ioctl(filp, cmd, arg) : -ENOTTY;
+
+	if (_IOC_TYPE(cmd) == MALI_INTERCEPT_IOCTL_TYPE) {
+		ret = mali_intercept_dispatch(filp, cmd, arg);
+	} else {
+		log_ioctl("compat  ", cmd);
+		ret = orig_compat_ioctl ?
+			orig_compat_ioctl(filp, cmd, arg) : -ENOTTY;
+	}
+
 	atomic_dec(&in_wrapper);
 	return ret;
 }
 
-/*
- * Снимает или ставит R/O защиту со страниц, в которых лежит target_fops.
- * Если kallsyms не нашёл set_memory_*, тихо ничего не делаем — значит
- * либо ядро без CONFIG_DEBUG_SET_MODULE_RONX (rodata уже writable),
- * либо запись просто не получится и init упадёт с понятной ошибкой.
- */
+/* =========================================================== */
+/* Подмена / восстановление kbase_fops                         */
+/* =========================================================== */
+
 static int set_fops_writable(int writable)
 {
 	unsigned long base, top;
@@ -143,11 +397,6 @@ static int __init mali_intercept_init(void)
 	struct kbase_device *probe;
 	int ret;
 
-	/*
-	 * Sanity-check: mali_kbase загружен и хотя бы один /dev/maliN
-	 * существует. Заодно фиксируем модульную зависимость от
-	 * mali_kbase (через сам факт вызова его символа).
-	 */
 	probe = kbase_find_device(-1);
 	if (!probe) {
 		pr_err("mali_intercept: kbase_find_device(-1) вернул NULL — "
@@ -189,8 +438,9 @@ static int __init mali_intercept_init(void)
 	(void)set_fops_writable(0);
 
 	pr_info("mali_intercept: установлен на kbase_fops @ %p "
-		"(original ioctl @ %pS)\n",
-		target_fops, orig_unlocked_ioctl);
+		"(original ioctl @ %pS); IMPORT_PHYS IOCTL = 0x%08lx\n",
+		target_fops, orig_unlocked_ioctl,
+		(unsigned long)MALI_INTERCEPT_IOCTL_IMPORT_PHYS);
 	return 0;
 }
 
@@ -209,9 +459,8 @@ static void __exit mali_intercept_exit(void)
 	/*
 	 * После восстановления указателей новых заходов в обёртки не
 	 * будет. Но кто-то мог успеть прочитать указатель wrapper_* до
-	 * подмены и сейчас находится между чтением указателя и
-	 * atomic_inc. Даём небольшую фору и потом ждём, пока счётчик
-	 * не опустится до нуля.
+	 * подмены и сейчас находится между чтением и atomic_inc. Даём
+	 * небольшую фору и потом ждём, пока счётчик не опустится до нуля.
 	 */
 	msleep(100);
 	while (atomic_read(&in_wrapper) > 0) {
@@ -231,5 +480,5 @@ module_exit(mali_intercept_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("mamaich");
-MODULE_DESCRIPTION("Перехват IOCTL для /dev/maliN через подмену kbase_fops");
-MODULE_VERSION("0.2");
+MODULE_DESCRIPTION("Перехват IOCTL + IMPORT_PHYS для /dev/maliN");
+MODULE_VERSION("0.3");
