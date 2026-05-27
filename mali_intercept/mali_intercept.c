@@ -124,6 +124,16 @@ typedef int (*set_memory_attr_fn)(unsigned long addr, int numpages);
 static set_memory_attr_fn set_memory_rw_fn;
 static set_memory_attr_fn set_memory_ro_fn;
 
+/*
+ * __close_fd в вендорном ядре Amlogic 4.9 не экспортирован, как и
+ * replace_fd. Ищем через kallsyms. Это требует, чтобы либо символ
+ * был EXPORT_SYMBOL (в стоковом 4.9 — да), либо ядро собрано с
+ * CONFIG_KALLSYMS_ALL=y (тогда виден и не экспортированный
+ * статический).
+ */
+typedef int (*close_fd_fn_t)(struct files_struct *files, unsigned fd);
+static close_fd_fn_t close_fd_fn;
+
 static atomic_t in_wrapper = ATOMIC_INIT(0);
 
 /* =========================================================== */
@@ -265,6 +275,14 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	long ret;
 	mm_segment_t old_fs;
 
+	if (!close_fd_fn) {
+		pr_err("mali_intercept: __close_fd недоступен — "
+		       "IMPORT_PHYS не может работать. Соберите ядро "
+		       "с CONFIG_KALLSYMS_ALL=y или экспортируйте "
+		       "__close_fd.\n");
+		return -ENOSYS;
+	}
+
 	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
 		return -EFAULT;
 
@@ -319,20 +337,17 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	set_fs(old_fs);
 
 	/*
-	 * Закрываем транзитный fd сразу. kbase_mem_from_umm() уже сделал
-	 * dma_buf_get → fget внутри, увеличив refcount нашего dma_buf
-	 * (точнее, его подложного struct file). Сам dma_buf останется
-	 * жить, пока mali не вызовет dma_buf_put в
-	 * kbase_mem_phy_alloc_free для KBASE_MEM_TYPE_IMPORTED_UMM —
+	 * Закрываем транзитный fd. kbase_mem_from_umm() уже сделал
+	 * dma_buf_get → fget внутри, увеличив refcount нашего dma_buf;
+	 * сам dma_buf останется жить, пока mali не вызовет dma_buf_put
+	 * в kbase_mem_phy_alloc_free для KBASE_MEM_TYPE_IMPORTED_UMM —
 	 * тогда сработает наш phys_dmabuf_release.
 	 *
-	 * Используем replace_fd(fd, NULL, 0): это экспортируемая
-	 * обёртка, которая при NULL-файле делегирует в __close_fd
-	 * (сам __close_fd экспортирован не во всех вендорных ядрах
-	 * Amlogic 4.9; "Unknown symbol __close_fd" при insmod — именно
-	 * это).
+	 * __close_fd/replace_fd в вендорном Amlogic-ядре 4.9 не
+	 * экспортированы, поэтому вызов идёт через указатель,
+	 * полученный из kallsyms_lookup_name в mali_intercept_init.
 	 */
-	replace_fd(fd, NULL, 0);
+	close_fd_fn(current->files, fd);
 
 	if (ret < 0)
 		return ret;
@@ -510,6 +525,12 @@ static int __init mali_intercept_init(void)
 		pr_warn("mali_intercept: set_memory_rw/ro не найдены через "
 			"kallsyms; пишу в .rodata напрямую — сработает только "
 			"если в ядре выключен CONFIG_DEBUG_SET_MODULE_RONX\n");
+
+	close_fd_fn = (close_fd_fn_t)kallsyms_lookup_name("__close_fd");
+	if (!close_fd_fn)
+		pr_warn("mali_intercept: __close_fd не найден через kallsyms; "
+			"IMPORT_PHYS IOCTL будет возвращать -ENOSYS. Возможно, "
+			"нужен CONFIG_KALLSYMS_ALL=y.\n");
 
 	orig_unlocked_ioctl = target_fops->unlocked_ioctl;
 	orig_compat_ioctl   = target_fops->compat_ioctl;
