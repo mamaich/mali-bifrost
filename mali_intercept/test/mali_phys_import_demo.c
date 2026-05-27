@@ -298,12 +298,17 @@ static void *mali_alloc_page(int fd, uint64_t *gpu_va_out)
 
 static void mali_free_page(int fd, void *cpu, uint64_t gpu_va)
 {
+	/*
+	 * SAME_VA-аллокация: munmap дёрнет kbase_cpu_vm_close, тот
+	 * декрементнёт refcount у cpu_alloc и при ref→0 mali сам
+	 * вычистит регион из reg_rbtree. Звать KBASE_IOCTL_MEM_FREE
+	 * поверх — лишний шаг, mali бы выдала warning "called with
+	 * nonexistent gpu_addr".
+	 */
+	(void)fd;
+	(void)gpu_va;
 	if (cpu)
 		munmap(cpu, PAGE_SZ_4K);
-	if (gpu_va) {
-		struct kbase_ioctl_mem_free mf = { .gpu_addr = gpu_va };
-		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
-	}
 }
 
 static void build_write_value_job(void *job_page, uint64_t target,
@@ -396,8 +401,6 @@ int main(void)
 	void *job = mali_alloc_page(fd, &job_gpu);
 	if (!job) {
 		munmap((void *)(uintptr_t)data_gpu, data_map_size);
-		struct kbase_ioctl_mem_free mf = { .gpu_addr = data_gpu };
-		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
 		close(fd);
 		return 1;
 	}
@@ -415,13 +418,10 @@ int main(void)
 
 	int rc = mali_submit_and_wait(fd, job_gpu, data_gpu);
 
-	/* Cleanup */
+	/* Cleanup — для SAME_VA одного munmap достаточно: kbase_cpu_vm_close
+	 * сам отстреливает регион. KBASE_IOCTL_MEM_FREE поверх не нужен. */
 	mali_free_page(fd, job, job_gpu);
 	munmap((void *)(uintptr_t)data_gpu, data_map_size);
-	{
-		struct kbase_ioctl_mem_free mf = { .gpu_addr = data_gpu };
-		ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
-	}
 
 	close(fd);
 	return rc;

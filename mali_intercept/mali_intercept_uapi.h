@@ -49,7 +49,13 @@
  *
  * Очистка:
  *   munmap(out.gpu_va, out.va_pages * PAGE_SIZE);
- *   ioctl(fd, KBASE_IOCTL_MEM_FREE, &(struct {__u64 gpu_addr;}){out.gpu_va});
+ *
+ *   Этого достаточно: при unmap последней VMA mali сам отстреливает
+ *   регион (kbase_cpu_vm_close → kbase_mem_free_region), убирает
+ *   GPU MMU маппинг и dma_buf_put-ит наш phys-dmabuf. Звать ещё
+ *   KBASE_IOCTL_MEM_FREE(out.gpu_va) поверх munmap НЕ нужно — он
+ *   найдёт регион уже снятым и выдаст warning "called with
+ *   nonexistent gpu_addr" в dmesg.
  */
 union mali_intercept_import_phys {
 	struct {
