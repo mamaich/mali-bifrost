@@ -81,6 +81,13 @@
 #define KBASE_IOCTL_TYPE_LOCAL          0x80
 #define KBASE_MEM_IMPORT_TYPE_UMM_LOCAL 2 /* enum base_mem_import_type */
 
+/*
+ * base_mem_alloc_flags bits, нужные для маппинга прав VMA на права
+ * импортируемого региона. Должны совпадать с mali_base_kernel.h.
+ */
+#define BASE_MEM_PROT_CPU_RD_LOCAL (1ull << 0)
+#define BASE_MEM_PROT_CPU_WR_LOCAL (1ull << 1)
+
 union kbase_ioctl_mem_import_local {
 	struct {
 		__u64 flags;
@@ -389,14 +396,28 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	 * vm_mmap кладёт VMA в адресное пространство вызывающего процесса
 	 * (то самое, чей kbase_context лежит в filp->private_data) — это
 	 * именно то, что нам нужно.
+	 *
+	 * Права в prot выводим строго из BASE_MEM_PROT_CPU_RD/WR флагов
+	 * импорта: kbase_mmap проверяет, что VMA не запрашивает больше
+	 * прав, чем у региона (KBASE_REG_CPU_RD/WR из reg->flags). При
+	 * несовпадении возвращает -EPERM с "inconsistent VM flags".
+	 * Берём из kparam.out.flags (после kbase_check_import_flags —
+	 * там, например, BASE_MEM_PROT_CPU_WR может быть отрезан).
 	 */
 	{
 		unsigned long ua;
+		unsigned long prot = 0;
 		unsigned long map_len =
 			(unsigned long)kparam.out.va_pages << PAGE_SHIFT;
 
-		ua = vm_mmap(filp, 0, map_len,
-			     PROT_READ | PROT_WRITE, MAP_SHARED,
+		if (kparam.out.flags & BASE_MEM_PROT_CPU_RD_LOCAL)
+			prot |= PROT_READ;
+		if (kparam.out.flags & BASE_MEM_PROT_CPU_WR_LOCAL)
+			prot |= PROT_WRITE;
+		if (!prot)
+			prot = PROT_NONE;
+
+		ua = vm_mmap(filp, 0, map_len, prot, MAP_SHARED,
 			     (unsigned long)kparam.out.gpu_va);
 
 		if (IS_ERR_VALUE(ua)) {
