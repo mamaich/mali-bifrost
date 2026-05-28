@@ -122,7 +122,11 @@ typedef struct base_jd_atom_v2 {
 /*  Logger                                                              */
 /* ------------------------------------------------------------------ */
 
-static int  (*real_ioctl)(int, unsigned long, ...) = NULL;
+/* bionic's ioctl is declared as int ioctl(int, int, ...) — match it
+ * exactly, otherwise clang refuses to overload. Internally we treat the
+ * request as unsigned through (unsigned)req when comparing against the
+ * _IOW/_IOR/_IOWR macros (which expand to unsigned constants). */
+static int  (*real_ioctl)(int, int, ...) = NULL;
 static FILE *g_log = NULL;
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -224,17 +228,19 @@ static void dump_job_submit(int fd, struct kbase_ioctl_job_submit *sub) {
     }
 }
 
-int ioctl(int fd, unsigned long req, ...) {
+int ioctl(int fd, int req, ...) {
     /* Always extract the pointer argument; kbase ioctls are all _IOW/_IOWR/_IOR
      * with a pointer payload. */
     va_list ap; va_start(ap, req);
     void *arg = va_arg(ap, void *);
     va_end(ap);
 
+    unsigned ureq = (unsigned)req;
+
     /* Pre-call: что хочет blob */
-    if ((req & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
-        unsigned nr = req & 0xff;
-        switch (req) {
+    if ((ureq & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
+        unsigned nr = ureq & 0xff;
+        switch (ureq) {
         case KBASE_IOCTL_VERSION_CHECK: {
             struct kbase_ioctl_version_check *v = arg;
             logf("[VERSION_CHECK fd=%d in major=%u minor=%u]\n",
@@ -276,7 +282,7 @@ int ioctl(int fd, unsigned long req, ...) {
             dump_job_submit(fd, arg);
             break;
         default:
-            logf("[ioctl fd=%d nr=%u req=0x%lx arg=%p]\n", fd, nr, req, arg);
+            logf("[ioctl fd=%d nr=%u req=0x%x arg=%p]\n", fd, nr, ureq, arg);
             break;
         }
     }
@@ -284,8 +290,8 @@ int ioctl(int fd, unsigned long req, ...) {
     int rc = real_ioctl(fd, req, arg);
 
     /* Post-call: что вернулось */
-    if (rc == 0 && (req & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
-        switch (req) {
+    if (rc == 0 && (ureq & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
+        switch (ureq) {
         case KBASE_IOCTL_VERSION_CHECK: {
             struct kbase_ioctl_version_check *v = arg;
             logf("  VERSION_CHECK< out major=%u minor=%u\n",
@@ -309,7 +315,7 @@ int ioctl(int fd, unsigned long req, ...) {
         }
         default: break;
         }
-    } else if (rc != 0 && (req & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
+    } else if (rc != 0 && (ureq & 0xff00) == (KBASE_IOCTL_TYPE << 8)) {
         logf("  -> rc=%d errno=%d %s\n", rc, errno, strerror(errno));
     }
 
