@@ -147,11 +147,30 @@ static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
  * проходит kbase ioctl. */
 static int g_mali_fd = -1;
 
+/* Если установлено в env — mmap/mmap64 НЕ перехватываем. Полезно для
+ * диагностики: если без mmap-hook'а observer не падает, виновник — он. */
+static int g_no_mmap = 0;
+
+/* Re-entrance guard: dlsym/malloc/fopen внутри конструктора могут сами
+ * звать mmap; наш hook должен такие вызовы безусловно пропускать в real_*,
+ * а не делать никаких dlsym/log'ов, чтобы не уйти в рекурсию. */
+static __thread int g_in_hook = 0;
+
 __attribute__((constructor))
 static void obs_init(void) {
-    real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
+    /* ВАЖНО: резолвим real_mmap/real_mmap64/real_ioctl ПЕРВЫМ делом, ДО
+     * любых вызовов libc, которые могут аллоцировать (getenv/fopen/malloc
+     * могут под капотом дернуть mmap). Если этого не сделать, первый же
+     * внутренний mmap уйдёт в наш hook с real_mmap == NULL и сегфолтнет. */
+    g_in_hook = 1;
     real_mmap   = dlsym(RTLD_NEXT, "mmap");
     real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
+    real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
+    g_in_hook = 0;
+
+    const char *no_mmap = getenv("MALI_OBS_NO_MMAP");
+    g_no_mmap = (no_mmap && *no_mmap && *no_mmap != '0');
+
     const char *path = getenv("MALI_OBS_LOG");
     if (path && *path) {
         g_log = fopen(path, "w");
@@ -160,7 +179,9 @@ static void obs_init(void) {
         g_log = stderr;
     }
     setvbuf(g_log, NULL, _IONBF, 0);
-    fprintf(g_log, "=== mali_ioctl_observer v2 attached pid=%d ===\n", getpid());
+    fprintf(g_log, "=== mali_ioctl_observer v2 attached pid=%d "
+                   "(mmap_hook=%s) ===\n",
+            getpid(), g_no_mmap ? "OFF" : "on");
 }
 
 static void logf(const char *fmt, ...) {
@@ -331,8 +352,20 @@ static void mmap_post(void *r, int fd, off64_t off, size_t len, int prot, int fl
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
+    /* Если внутренняя реализация ещё не разрезолвлена — пытаемся через
+     * dlsym, но под guard'ом, чтобы рекурсивный mmap из dlsym не падал. */
+    if (!real_mmap && !g_in_hook) {
+        g_in_hook = 1;
+        real_mmap = dlsym(RTLD_NEXT, "mmap");
+        g_in_hook = 0;
+    }
+    if (!real_mmap) { errno = ENOSYS; return MAP_FAILED; }
+
     void *r = real_mmap(addr, len, prot, flags, fd, off);
+
+    /* Hook-логику пропускаем во время рекурсии и если она выключена. */
+    if (g_no_mmap || g_in_hook) return r;
+    g_in_hook = 1;
     /* На 32-bit Android off_t — signed 32-bit, cookie'и небольшие — OK.
      * Большие offset'ы для non-SAME_VA blob берёт через mmap64. На 64 битах
      * off_t уже 64-битный, кастуем напрямую. */
@@ -342,13 +375,24 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     off64_t off64 = (off64_t)(uint32_t)off;  /* avoid sign extension on small cookies */
 #endif
     mmap_post(r, fd, off64, len, prot, flags);
+    g_in_hook = 0;
     return r;
 }
 
 void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off64_t off) {
-    if (!real_mmap64) real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
+    if (!real_mmap64 && !g_in_hook) {
+        g_in_hook = 1;
+        real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
+        g_in_hook = 0;
+    }
+    if (!real_mmap64) { errno = ENOSYS; return MAP_FAILED; }
+
     void *r = real_mmap64(addr, len, prot, flags, fd, off);
+
+    if (g_no_mmap || g_in_hook) return r;
+    g_in_hook = 1;
     mmap_post(r, fd, off, len, prot, flags);
+    g_in_hook = 0;
     return r;
 }
 
@@ -441,6 +485,17 @@ int ioctl(int fd, int req, ...) {
     va_list ap; va_start(ap, req);
     void *arg = va_arg(ap, void *);
     va_end(ap);
+
+    /* Защита от вызова до конструктора. */
+    if (!real_ioctl && !g_in_hook) {
+        g_in_hook = 1;
+        real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+        g_in_hook = 0;
+    }
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+
+    /* Рекурсия — pass-through без логирования. */
+    if (g_in_hook) return real_ioctl(fd, req, arg);
 
     unsigned ureq = (unsigned)req;
     int is_kbase = (ureq & 0xff00) == (KBASE_IOCTL_TYPE << 8);
