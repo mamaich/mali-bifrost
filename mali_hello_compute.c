@@ -13,10 +13,21 @@
  *   - залогировать кое-что про FD /dev/mali0 и про BO, чтобы в логе
  *     observer'а можно было сопоставить GPU VA с буферами.
  *
- * Build (Android NDK, aarch64):
- *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang \
+ * Build (Android NDK):
+ *
+ *   # 32-bit ARM userspace (типичный S905X2 stock — 64-bit kernel,
+ *   # но 32-bit Android, поэтому нет /system/bin/linker64):
+ *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
  *       -Wall -O2 mali_hello_compute.c -o mali_hello_compute \
- *       -lEGL -lGLESv3
+ *       -lEGL -lGLESv2
+ *
+ *   # 64-bit ARM userspace (если на устройстве есть /system/bin/linker64):
+ *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
+ *       -Wall -O2 mali_hello_compute.c -o mali_hello_compute \
+ *       -lEGL -lGLESv2
+ *
+ * Линкуем -lGLESv2 (а не -lGLESv3) — libGLESv2.so на Android содержит
+ * все ES 3.x символы, отдельной libGLESv3.so на устройстве обычно нет.
  *
  * Run:
  *   adb push mali_hello_compute /data/local/tmp/

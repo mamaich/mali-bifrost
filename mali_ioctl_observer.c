@@ -16,8 +16,17 @@
  *
  * Лог идёт в stderr либо в файл из переменной окружения MALI_OBS_LOG.
  *
- * Build (Android NDK, aarch64):
- *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang \
+ * Build (Android NDK).
+ *
+ * Важно: разрядность shim'а ДОЛЖНА совпадать с разрядностью
+ * mali_hello_compute (и реального процесса, в который он подгружается).
+ *
+ *   # 32-bit:
+ *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
+ *       -Wall -O2 -fPIC -shared -o libmali_observer.so mali_ioctl_observer.c -ldl
+ *
+ *   # 64-bit:
+ *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
  *       -Wall -O2 -fPIC -shared -o libmali_observer.so mali_ioctl_observer.c -ldl
  *
  * Run:
