@@ -1,21 +1,19 @@
 /*
- * mali_ioctl_observer.c  (v2)
+ * mali_ioctl_observer.c  (v3)
  *
- * LD_PRELOAD-shim для intercept'a kbase ioctl + mmap/mmap64. Цели:
+ * LD_PRELOAD-shim для intercept'a kbase ioctl. Цели:
  *   - открытие /dev/mali0, VERSION_CHECK/SET_FLAGS;
- *   - аллокации (MEM_ALLOC, MEM_IMPORT) — какие GPU VA возвращает kbase,
- *     и куда blob их потом mmap-ит (нужно для SAME_VA cookie -> user VA);
- *   - JOB_SUBMIT с BASE_JD_REQ_CS: hex-дамп Compute Job descriptor по `jc`,
+ *   - аллокации (MEM_ALLOC, MEM_IMPORT) — какие GPU VA возвращает kbase;
+ *   - JOB_SUBMIT с BASE_JD_REQ_CS: hex-дамп Compute Job descriptor по `jc`
  *     ПЛЮС сканирование `jc` на 8-байтные значения, попадающие внутрь
  *     известных живых аллокаций (помогает найти SSBO/shader_meta-указатели,
  *     включая tagged-pointers с битами 0..3),
- *     ПЛЮС дамп первых 128 байт каждой живой CPU-accessible аллокации
- *     (так находим SSBO src/dst по нашим маркерам 0xAABBxxxx / 0xDEADBEEF).
+ *     ПЛЮС дамп первых 128 байт каждой живой CPU-accessible аллокации.
  *
- * Полагается на SAME_VA: для аллокаций с битом BASE_MEM_SAME_VA реальный
- * GPU VA равен адресу, который вернёт mmap (cookie → user VA). Для
- * non-SAME_VA gpu_va из MEM_ALLOC сразу годится как «GPU VA», а
- * соответствующий cpu_va получается из mmap по тому же offset.
+ * Принципиально: ВСЕ соответствия cookie→user VA вытаскиваются
+ * из /proc/self/maps непосредственно перед дампом. Перехватывать сам mmap
+ * не пытаемся (это конфликтует с инициализацией libc), а опираемся на
+ * то, что ядро ставит у VMA `vm_file = /dev/mali0` и `vm_pgoff = cookie`.
  *
  * Лог: stderr или $MALI_OBS_LOG.
  *
@@ -93,10 +91,9 @@ union kbase_ioctl_mem_import {
 #define KBASE_IOCTL_MEM_IMPORT \
     _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
 
-#define BASE_MEM_SAME_VA   (1ull << 13)
+#define BASE_MEM_SAME_VA      (1ull << 13)
 #define BASE_MEM_COOKIE_BASE  (64ul << 12)
 
-/* base_jd_atom_v2 — same layout as in mali_write_value_demo.c */
 typedef uint32_t base_jd_core_req;
 #define BASE_JD_REQ_FS                  ((base_jd_core_req)1 << 0)
 #define BASE_JD_REQ_CS                  ((base_jd_core_req)1 << 1)
@@ -136,41 +133,13 @@ typedef struct base_jd_atom_v2 {
 /*  Logger                                                              */
 /* ------------------------------------------------------------------ */
 
-/* bionic's ioctl is declared as int ioctl(int, int, ...) */
-static int   (*real_ioctl)(int, int, ...) = NULL;
-static void *(*real_mmap)(void *, size_t, int, int, int, off_t)   = NULL;
-static void *(*real_mmap64)(void *, size_t, int, int, int, off64_t) = NULL;
+static int (*real_ioctl)(int, int, ...) = NULL;
 static FILE *g_log = NULL;
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* fd, через который blob говорит с kbase — запоминаем первый, на котором
- * проходит kbase ioctl. */
-static int g_mali_fd = -1;
-
-/* Если установлено в env — mmap/mmap64 НЕ перехватываем. Полезно для
- * диагностики: если без mmap-hook'а observer не падает, виновник — он. */
-static int g_no_mmap = 0;
-
-/* Re-entrance guard: dlsym/malloc/fopen внутри конструктора могут сами
- * звать mmap; наш hook должен такие вызовы безусловно пропускать в real_*,
- * а не делать никаких dlsym/log'ов, чтобы не уйти в рекурсию. */
-static __thread int g_in_hook = 0;
-
 __attribute__((constructor))
 static void obs_init(void) {
-    /* ВАЖНО: резолвим real_mmap/real_mmap64/real_ioctl ПЕРВЫМ делом, ДО
-     * любых вызовов libc, которые могут аллоцировать (getenv/fopen/malloc
-     * могут под капотом дернуть mmap). Если этого не сделать, первый же
-     * внутренний mmap уйдёт в наш hook с real_mmap == NULL и сегфолтнет. */
-    g_in_hook = 1;
-    real_mmap   = dlsym(RTLD_NEXT, "mmap");
-    real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
-    real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
-    g_in_hook = 0;
-
-    const char *no_mmap = getenv("MALI_OBS_NO_MMAP");
-    g_no_mmap = (no_mmap && *no_mmap && *no_mmap != '0');
-
+    real_ioctl = dlsym(RTLD_NEXT, "ioctl");
     const char *path = getenv("MALI_OBS_LOG");
     if (path && *path) {
         g_log = fopen(path, "w");
@@ -179,9 +148,7 @@ static void obs_init(void) {
         g_log = stderr;
     }
     setvbuf(g_log, NULL, _IONBF, 0);
-    fprintf(g_log, "=== mali_ioctl_observer v2 attached pid=%d "
-                   "(mmap_hook=%s) ===\n",
-            getpid(), g_no_mmap ? "OFF" : "on");
+    fprintf(g_log, "=== mali_ioctl_observer v3 attached pid=%d ===\n", getpid());
 }
 
 static void logf(const char *fmt, ...) {
@@ -234,12 +201,11 @@ static const char *core_req_str(base_jd_core_req r) {
 #define MAX_ALLOCS 4096
 
 struct alloc_entry {
-    uint64_t cookie;     /* что вернул MEM_ALLOC: либо реальный gpu_va (no SAME_VA),
-                          * либо cookie (>=BASE_MEM_COOKIE_BASE для SAME_VA) */
-    uint64_t gpu_va;     /* финальный GPU VA: после mmap для SAME_VA, иначе == cookie */
+    uint64_t cookie;     /* что вернул MEM_ALLOC: cookie или gpu_va */
+    uint64_t gpu_va;     /* итоговый GPU VA (== user VA для SAME_VA) */
     uint64_t va_pages;
     uint64_t flags;
-    void    *cpu_va;     /* mmap'd адрес (CPU-видимый) */
+    void    *cpu_va;     /* user-side mapping (заполняется из /proc/self/maps) */
     int      is_import;
     int      valid;
 };
@@ -248,14 +214,13 @@ static struct alloc_entry g_allocs[MAX_ALLOCS];
 static int g_n_allocs = 0;
 static pthread_mutex_t g_allocs_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-static struct alloc_entry *alloc_add(uint64_t cookie, uint64_t va_pages,
-                                     uint64_t flags, int is_import) {
+static void alloc_add(uint64_t cookie, uint64_t va_pages,
+                      uint64_t flags, int is_import) {
     pthread_mutex_lock(&g_allocs_mtx);
-    struct alloc_entry *e = NULL;
     if (g_n_allocs < MAX_ALLOCS) {
-        e = &g_allocs[g_n_allocs++];
+        struct alloc_entry *e = &g_allocs[g_n_allocs++];
         e->cookie    = cookie;
-        e->gpu_va    = cookie;     /* временно; обновим в mmap для SAME_VA */
+        e->gpu_va    = cookie;
         e->va_pages  = va_pages;
         e->flags     = flags;
         e->cpu_va    = NULL;
@@ -263,24 +228,6 @@ static struct alloc_entry *alloc_add(uint64_t cookie, uint64_t va_pages,
         e->valid     = 1;
     }
     pthread_mutex_unlock(&g_allocs_mtx);
-    return e;
-}
-
-/* Найти наиболее недавнюю запись по «cookie/offset», у которой ещё не
- * установлен cpu_va. Cookie у SAME_VA переиспользуется, поэтому ищем
- * именно «висящие» (cpu_va == NULL). */
-static struct alloc_entry *alloc_find_pending(uint64_t off) {
-    pthread_mutex_lock(&g_allocs_mtx);
-    struct alloc_entry *r = NULL;
-    for (int i = g_n_allocs - 1; i >= 0; i--) {
-        if (g_allocs[i].valid && g_allocs[i].cookie == off &&
-            g_allocs[i].cpu_va == NULL) {
-            r = &g_allocs[i];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_allocs_mtx);
-    return r;
 }
 
 static struct alloc_entry *alloc_find_containing(uint64_t addr) {
@@ -311,89 +258,67 @@ static void alloc_remove(uint64_t gpu_addr) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  mmap / mmap64 interceptor                                           */
+/*  /proc/self/maps scanner                                            */
 /* ------------------------------------------------------------------ */
 
-static void mmap_post(void *r, int fd, off64_t off, size_t len, int prot, int flags) {
-    if (r == MAP_FAILED || fd != g_mali_fd) return;
-    uint64_t off_u = (uint64_t)off;
-    struct alloc_entry *e = alloc_find_pending(off_u);
-    if (!e) {
-        /* Может быть, это не cookie, а реальный gpu_va non-SAME_VA-аллока,
-         * который blob mmap-ит. Тогда entry уже есть и у него cookie == gpu_va. */
+/* Подтянуть cpu_va всем известным аллокациям, посмотрев актуальные
+ * VMA из /proc/self/maps. Сопоставление идёт по offset поля VMA с
+ * cookie/gpu_va. Для SAME_VA это «cookie 0x41000» → start адрес VMA;
+ * для non-SAME_VA это полный gpu_va (например, 0x100000000) → start.
+ *
+ * Из ridiculously простого: одна сторона раз в submit, никаких hook'ов. */
+static void scan_proc_maps(int verbose) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) {
+        logf("  scan_proc_maps: cannot open /proc/self/maps: %s\n",
+             strerror(errno));
+        return;
+    }
+
+    char line[1024];
+    int n_matched = 0, n_mali_lines = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* Интересуют только VMA, привязанные к /dev/mali0 */
+        if (!strstr(line, "/dev/mali")) continue;
+        n_mali_lines++;
+
+        unsigned long long start, end, off;
+        char perms[16];
+        int n = sscanf(line, "%llx-%llx %15s %llx",
+                       &start, &end, perms, &off);
+        if (n < 4) continue;
+
+        if (verbose) {
+            logf("  maps: %012llx-%012llx %s off=0x%llx (%llu KiB)\n",
+                 start, end, perms, off, (end - start) / 1024);
+        }
+
+        /* Найти запись по cookie == off */
         pthread_mutex_lock(&g_allocs_mtx);
-        for (int i = g_n_allocs - 1; i >= 0; i--) {
-            if (g_allocs[i].valid && g_allocs[i].cookie == off_u) {
-                e = &g_allocs[i];
-                break;
+        for (int i = 0; i < g_n_allocs; i++) {
+            struct alloc_entry *e = &g_allocs[i];
+            if (!e->valid) continue;
+            if (e->cookie != off) continue;
+            /* Запоминаем cpu_va только если она ещё не была. Иначе
+             * пере-mapping может перетереть актуальный адрес. */
+            if (!e->cpu_va) {
+                e->cpu_va = (void *)(uintptr_t)start;
+                if (e->flags & BASE_MEM_SAME_VA) {
+                    /* Для SAME_VA реальный GPU VA — это адрес из VMA. */
+                    e->gpu_va = start;
+                }
+                n_matched++;
             }
+            break;
         }
         pthread_mutex_unlock(&g_allocs_mtx);
     }
-    if (e) {
-        e->cpu_va = r;
-        if (e->flags & BASE_MEM_SAME_VA) {
-            /* Для SAME_VA реальный GPU VA — это и есть результат mmap. */
-            e->gpu_va = (uint64_t)(uintptr_t)r;
-        }
-        logf("[mmap fd=%d off=0x%llx len=%zu prot=0x%x flags=0x%x → %p  "
-             "(matched cookie=0x%llx, gpu_va=0x%llx, %llu pages, flags=0x%llx, %s)]\n",
-             fd, (unsigned long long)off_u, len, prot, flags, r,
-             (unsigned long long)e->cookie,
-             (unsigned long long)e->gpu_va,
-             (unsigned long long)e->va_pages,
-             (unsigned long long)e->flags,
-             e->is_import ? "IMPORT" : "ALLOC");
-    } else {
-        logf("[mmap fd=%d off=0x%llx len=%zu prot=0x%x flags=0x%x → %p  "
-             "(untracked)]\n",
-             fd, (unsigned long long)off_u, len, prot, flags, r);
+    fclose(f);
+
+    if (verbose) {
+        logf("  scan_proc_maps: %d /dev/mali lines, %d new cpu_va matched\n",
+             n_mali_lines, n_matched);
     }
-}
-
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    /* Если внутренняя реализация ещё не разрезолвлена — пытаемся через
-     * dlsym, но под guard'ом, чтобы рекурсивный mmap из dlsym не падал. */
-    if (!real_mmap && !g_in_hook) {
-        g_in_hook = 1;
-        real_mmap = dlsym(RTLD_NEXT, "mmap");
-        g_in_hook = 0;
-    }
-    if (!real_mmap) { errno = ENOSYS; return MAP_FAILED; }
-
-    void *r = real_mmap(addr, len, prot, flags, fd, off);
-
-    /* Hook-логику пропускаем во время рекурсии и если она выключена. */
-    if (g_no_mmap || g_in_hook) return r;
-    g_in_hook = 1;
-    /* На 32-bit Android off_t — signed 32-bit, cookie'и небольшие — OK.
-     * Большие offset'ы для non-SAME_VA blob берёт через mmap64. На 64 битах
-     * off_t уже 64-битный, кастуем напрямую. */
-#if defined(__LP64__) || defined(_LP64)
-    off64_t off64 = (off64_t)off;
-#else
-    off64_t off64 = (off64_t)(uint32_t)off;  /* avoid sign extension on small cookies */
-#endif
-    mmap_post(r, fd, off64, len, prot, flags);
-    g_in_hook = 0;
-    return r;
-}
-
-void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off64_t off) {
-    if (!real_mmap64 && !g_in_hook) {
-        g_in_hook = 1;
-        real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
-        g_in_hook = 0;
-    }
-    if (!real_mmap64) { errno = ENOSYS; return MAP_FAILED; }
-
-    void *r = real_mmap64(addr, len, prot, flags, fd, off);
-
-    if (g_no_mmap || g_in_hook) return r;
-    g_in_hook = 1;
-    mmap_post(r, fd, off, len, prot, flags);
-    g_in_hook = 0;
-    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -432,13 +357,12 @@ static void scan_jc_pointers(const void *jc_cpu, size_t bytes) {
         struct alloc_entry *e = alloc_find_containing(val);
         const char *note = "";
         if (!e) {
-            /* Попробуем как tagged-pointer: маска младших 4 бит. */
             struct alloc_entry *e2 = alloc_find_containing(val & ~0xfULL);
             if (e2) { e = e2; note = " (low-4-bits tagged)"; }
         }
         if (e) {
             uint64_t off_in = (val & ~0xfULL) - e->gpu_va;
-            logf("    jc+0x%03zx: 0x%016llx → alloc#? gpu_va=0x%llx +0x%llx "
+            logf("    jc+0x%03zx: 0x%016llx → gpu_va=0x%llx +0x%llx "
                  "(%llu pg, flags=0x%llx, %s)%s\n",
                  k * 8, (unsigned long long)val,
                  (unsigned long long)e->gpu_va,
@@ -465,13 +389,22 @@ static void dump_job_submit(int fd, struct kbase_ioctl_job_submit *sub) {
              i, a->atom_number, a->core_req, core_req_str(a->core_req),
              (unsigned long long)a->jc, a->nr_extres,
              (unsigned long long)a->extres_list);
+        if (a->core_req & BASE_JD_REQ_CS) has_cs = 1;
+    }
+
+    /* Перед самим дампом подтянем все cpu_va из /proc/self/maps —
+     * это переведёт «висящие» (только cookie известен) аллокации в
+     * рабочее состояние. */
+    if (has_cs) scan_proc_maps(/*verbose=*/1);
+
+    for (uint32_t i = 0; i < sub->nr_atoms; i++) {
+        base_jd_atom_v2 *a = (base_jd_atom_v2 *)
+            ((char *)(uintptr_t)sub->addr + (size_t)i * sub->stride);
 
         if ((a->core_req & BASE_JD_REQ_CS) && a->jc) {
-            has_cs = 1;
             hexdump("jc", (void *)(uintptr_t)a->jc, 768);
             scan_jc_pointers((const void *)(uintptr_t)a->jc, 768);
         }
-
         if (a->nr_extres && a->extres_list) {
             size_t n = (size_t)a->nr_extres * sizeof(uint64_t);
             hexdump("extres_list", (void *)(uintptr_t)a->extres_list, n);
@@ -486,25 +419,14 @@ int ioctl(int fd, int req, ...) {
     void *arg = va_arg(ap, void *);
     va_end(ap);
 
-    /* Защита от вызова до конструктора. */
-    if (!real_ioctl && !g_in_hook) {
-        g_in_hook = 1;
-        real_ioctl = dlsym(RTLD_NEXT, "ioctl");
-        g_in_hook = 0;
-    }
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
     if (!real_ioctl) { errno = ENOSYS; return -1; }
-
-    /* Рекурсия — pass-through без логирования. */
-    if (g_in_hook) return real_ioctl(fd, req, arg);
 
     unsigned ureq = (unsigned)req;
     int is_kbase = (ureq & 0xff00) == (KBASE_IOCTL_TYPE << 8);
 
-    /* Запоминаем mali fd по первому kbase ioctl. */
-    if (is_kbase && g_mali_fd < 0) g_mali_fd = fd;
-
-    /* Pre-call: что хочет blob. Параллельно копируем «in»-поля, потому
-     * что post-call мы видим уже перезаписанные «out»-поля. */
+    /* Pre-call. Параллельно копируем «in»-поля, потому что post-call мы
+     * увидим уже перезаписанные «out». */
     uint64_t in_alloc_pages = 0;
     if (is_kbase) {
         unsigned nr = ureq & 0xff;
