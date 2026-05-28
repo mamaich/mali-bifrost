@@ -87,6 +87,7 @@
  */
 #define BASE_MEM_PROT_CPU_RD_LOCAL (1ull << 0)
 #define BASE_MEM_PROT_CPU_WR_LOCAL (1ull << 1)
+#define BASE_MEM_SECURE_LOCAL      (1ull << 16)
 
 union kbase_ioctl_mem_import_local {
 	struct {
@@ -324,11 +325,12 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	if (param.in.length & ~PAGE_MASK)
 		return -EINVAL;
 
-	pr_info("mali_intercept: IMPORT_PHYS pid=%d phys=0x%llx len=0x%llx flags=0x%llx\n",
+	pr_info("mali_intercept: IMPORT_PHYS pid=%d phys=0x%llx len=0x%llx flags=0x%llx%s\n",
 		current->pid,
 		(unsigned long long)param.in.phys_addr,
 		(unsigned long long)param.in.length,
-		(unsigned long long)param.in.flags);
+		(unsigned long long)param.in.flags,
+		(param.in.flags & BASE_MEM_SECURE_LOCAL) ? " [SECURE]" : "");
 
 	dbuf = phys_dmabuf_create((phys_addr_t)param.in.phys_addr,
 				  (size_t)param.in.length);
@@ -403,6 +405,16 @@ static long handle_import_phys(struct file *filp, unsigned long arg)
 	 * несовпадении возвращает -EPERM с "inconsistent VM flags".
 	 * Берём из kparam.out.flags (после kbase_check_import_flags —
 	 * там, например, BASE_MEM_PROT_CPU_WR может быть отрезан).
+	 *
+	 * Для BASE_MEM_SECURE-импорта пользователь обязан не запрашивать
+	 * BASE_MEM_PROT_CPU_RD/WR (контракт mali: "secure нельзя CPU
+	 * читать"), поэтому prot тут естественно становится PROT_NONE.
+	 * vm_mmap всё равно вызывается — он нужен, чтобы превратить
+	 * cookie в реальный gpu_va. Получившаяся VMA технически
+	 * существует в адресном пространстве процесса, но никаких PTE
+	 * с доступом не имеет (PAGE_NONE) — любое CPU обращение
+	 * прилетит SIGSEGV. Это то, что и просили: "secure без mmap
+	 * на CPU".
 	 */
 	{
 		unsigned long ua;

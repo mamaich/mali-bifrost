@@ -55,6 +55,25 @@
 #define DEMO_PHYS_ADDR  0x12345000ULL
 #define DEMO_LENGTH     0x1000ULL
 
+/*
+ * Переключатель режима импорта.
+ *   0 — non-secure: GPU работает в обычном режиме, к gpu_va можно
+ *       (теоретически) обратиться и с CPU, если флаги BASE_MEM_PROT_CPU_*
+ *       выставлены. В этой демке мы CPU не читаем — сразу шлём job.
+ *   1 — secure: добавляется флаг BASE_MEM_SECURE, mali ставит регион
+ *       как KBASE_REG_SECURE, при выполнении job-а GPU переходит в
+ *       protected mode. К gpu_va НЕЛЬЗЯ обращаться из CPU — VMA в
+ *       PROT_NONE, dereference даст SIGSEGV.
+ *
+ * Для реального secure-сценария нужно: (а) spec-драйвер, который
+ * легально выдаёт PA из TrustZone secure-карвоута; (б) BL31/ATF,
+ * умеющий переключать mali в protected mode; (в) TZASC,
+ * сконфигурированный так, чтобы Mali Secure-master имел доступ к
+ * этому секурному диапазону. Без всех трёх — job упадёт с
+ * MMU/BUS fault, что для нашего тестирования не страшно.
+ */
+#define USE_SECURE_IMPORT 0
+
 /* ------------------------------------------------------------------ */
 /* Subset of the kbase ABI (from mali_kbase_ioctl.h / mali_base_kernel.h) */
 /* ------------------------------------------------------------------ */
@@ -109,6 +128,7 @@ struct kbase_ioctl_mem_free {
 #define BASE_MEM_PROT_GPU_RD             (1ull << 2)
 #define BASE_MEM_PROT_GPU_WR             (1ull << 3)
 #define BASE_MEM_SAME_VA                 (1ull << 13)
+#define BASE_MEM_SECURE                  (1ull << 16)
 
 /* special pgoff handle for the "tracking page" that must be mapped first */
 #define BASE_MEM_MAP_TRACKING_HANDLE     (3ull << 12)
@@ -247,8 +267,16 @@ static int mali_import_phys(int fd, uint64_t phys, uint64_t length,
 	memset(&p, 0, sizeof(p));
 	p.in.phys_addr = phys;
 	p.in.length    = length;
-	p.in.flags     = BASE_MEM_PROT_CPU_RD |
-	                 BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+#if USE_SECURE_IMPORT
+	/* Secure-импорт: никакого CPU-доступа.
+	 * BASE_MEM_PROT_CPU_RD/WR не выставляем, иначе mali откажет;
+	 * получившаяся VMA будет PROT_NONE — CPU из неё читать нельзя. */
+	p.in.flags = BASE_MEM_SECURE |
+	             BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+#else
+	p.in.flags = BASE_MEM_PROT_CPU_RD |
+	             BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+#endif
 
 	if (ioctl(fd, MALI_INTERCEPT_IOCTL_IMPORT_PHYS, &p) < 0) {
 		fprintf(stderr, "IMPORT_PHYS: %s\n", strerror(errno));
@@ -391,10 +419,11 @@ int main(void)
 		close(fd);
 		return 1;
 	}
-	printf("imported phys=%#llx len=%#llx -> gpu_va=%#llx (готовый, без mmap)\n",
+	printf("imported phys=%#llx len=%#llx -> gpu_va=%#llx (готовый, без mmap)%s\n",
 	       (unsigned long long)DEMO_PHYS_ADDR,
 	       (unsigned long long)DEMO_LENGTH,
-	       (unsigned long long)data_gpu);
+	       (unsigned long long)data_gpu,
+	       USE_SECURE_IMPORT ? "  [SECURE — CPU-доступа нет]" : "");
 
 	/* job descriptor — обычная SAME_VA аллокация */
 	uint64_t job_gpu = 0;

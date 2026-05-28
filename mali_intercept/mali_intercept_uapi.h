@@ -34,8 +34,20 @@
  * @in.phys_addr:  Физический адрес начала буфера в CPU RAM.
  *                 Должен быть page-aligned.
  * @in.length:     Длина буфера в байтах. Должна быть кратна PAGE_SIZE.
- * @in.flags:      Биты BASE_MEM_* (PROT_GPU_RD/WR и т.д.) — те же,
+ * @in.flags:      Биты BASE_MEM_* (PROT_GPU_RD/WR, и т.д.) — те же,
  *                 что принимает KBASE_IOCTL_MEM_IMPORT.
+ *
+ *                 Поддерживается BASE_MEM_SECURE (бит 16) — импорт
+ *                 памяти из TrustZone secure-карвоута. В этом случае
+ *                 НЕ выставлять BASE_MEM_PROT_CPU_RD / _CPU_WR (mali
+ *                 откажет, и сам контракт secure такого не допускает).
+ *                 Получившийся out.gpu_va будет валиден для GPU, но
+ *                 не доступен для CPU-чтения/записи: при попытке
+ *                 dereference из userspace процесс получит SIGSEGV.
+ *                 Spec-драйвер, выдавший secure-PA, должен сам
+ *                 гарантировать, что эта область действительно secure
+ *                 в TZASC; mali_intercept никакой собственной
+ *                 валидации не делает.
  *
  * @out.gpu_va:    Готовый GPU VA, по которому замаплен буфер.
  *                 В отличие от штатного KBASE_IOCTL_MEM_IMPORT, это
@@ -43,11 +55,13 @@
  *                 ядра через vm_mmap, поэтому пользователю не нужно
  *                 ничего домапывать. Для 64-битного non-compat
  *                 вызывающего эта же VA является CPU VA (SAME_VA).
+ *                 Для secure-импорта VMA создаётся в PROT_NONE
+ *                 режиме — CPU доступа нет.
  * @out.va_pages:  Размер маппинга в страницах PAGE_SIZE.
  * @out.flags:     Итоговые флаги, как их выставил mali_kbase
  *                 (может убрать неподдерживаемые биты).
  *
- * Очистка:
+ * Очистка (одинаково для secure и non-secure):
  *   munmap(out.gpu_va, out.va_pages * PAGE_SIZE);
  *
  *   Этого достаточно: при unmap последней VMA mali сам отстреливает
