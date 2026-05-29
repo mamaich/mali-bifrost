@@ -523,6 +523,27 @@ int main(void) {
     /* Alternative: open own fd with full handshake (separate AS):
      *   fd = mali_open_and_handshake(); */
 
+    /*
+     * Allocate the patcher destination as a SAME_VA MEM_ALLOC buffer.
+     *
+     * USER_BUFFER imports use LAZY GPU mapping on non-coherent hardware
+     * (mali_kbase_mem_linux.c: KBASE_MEM_IMPORT_HAVE_PAGES is only set when
+     * KBASE_REG_SHARE_BOTH is set, i.e. CPU-GPU coherent memory).  The GPU
+     * page-table entry is populated only when a job lists the buffer as an
+     * external resource.  The patched GLES compute atom carries no such entry
+     * for Buff[], so the GPU faults with TRANSLATION_FAULT / "Memory is not
+     * growable" (KBASE_REG_GROWABLE is explicitly cleared for imported regions).
+     *
+     * SAME_VA MEM_ALLOC sets up the GPU page-table entry eagerly at mmap()
+     * time, so the patched shader can write without any external-resource
+     * registration.
+     */
+    uint64_t data_gpu = 0;
+    void *data_buf = mali_alloc_page(fd, &data_gpu);
+    if (!data_buf) die("mali_alloc_page (patcher dest)");
+    printf("patcher dest: cpu=%p gpu_va=0x%llx\n",
+           data_buf, (unsigned long long)data_gpu);
+
     /* ---- GLES buffers ---- */
     uint32_t *init = (uint32_t *)malloc(PAGE_SZ_4K);
     if (!init) die("malloc init");
@@ -547,6 +568,8 @@ int main(void) {
     GLuint prog = build_program();
     glUseProgram(prog);
 
+    /* Redirect compute output to the SAME_VA buffer before dispatch. */
+    g_target_dst = data_gpu;
     publish_targets_to_patcher();
 
     fprintf(stderr, "dispatching: %u work items in %u groups\n",
@@ -555,31 +578,36 @@ int main(void) {
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
     glFinish();
 
+    /* Compute result is now in data_buf (SAME_VA, readable from CPU). */
+    hex16("COMPUTE DST ", data_buf);
+
     /* ---- Direct kbase: WRITE_VALUE job into Buff[] ---- */
-    uint64_t data_gpu = 0;
+    uint64_t buff_gpu = 0;
     void *import_cookie_map = NULL;
     if (mali_import_user_buffer(fd, Buff, sizeof(Buff),
-                                &data_gpu, &import_cookie_map) < 0) {
+                                &buff_gpu, &import_cookie_map) < 0) {
+        mali_free_page(fd, data_buf, data_gpu);
         close(fd); return 1;
     }
     printf("imported Buff[%zu] (cpu=%p) -> gpu_va=%#llx\n",
-           sizeof(Buff), (void *)Buff, (unsigned long long)data_gpu);
+           sizeof(Buff), (void *)Buff, (unsigned long long)buff_gpu);
 
     uint64_t job_gpu = 0;
     void *job = mali_alloc_page(fd, &job_gpu);
     if (!job) {
         munmap(import_cookie_map, sizeof(Buff));
-        struct kbase_ioctl_mem_free mf = { .gpu_addr = data_gpu };
+        struct kbase_ioctl_mem_free mf = { .gpu_addr = buff_gpu };
         ioctl(fd, KBASE_IOCTL_MEM_FREE, &mf);
+        mali_free_page(fd, data_buf, data_gpu);
         close(fd); return 1;
     }
 
-    build_write_value_job(job, data_gpu, 0x12345678u);
+    build_write_value_job(job, buff_gpu, 0x12345678u);
 
     printf("submit: jc=%#llx -> [%#llx] = 0x12345678\n",
-           (unsigned long long)job_gpu, (unsigned long long)data_gpu);
+           (unsigned long long)job_gpu, (unsigned long long)buff_gpu);
 
-    int rc = mali_submit_and_wait(fd, job_gpu, data_gpu);
+    int rc = mali_submit_and_wait(fd, job_gpu, buff_gpu);
 
     hex16("AFTER ", Buff);
     uint32_t v;
@@ -589,6 +617,7 @@ int main(void) {
 
     mali_free_page(fd, job, job_gpu);
     munmap(import_cookie_map, sizeof(Buff));
+    mali_free_page(fd, data_buf, data_gpu);
 
     /* ---- GLES verify ---- */
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, bos[1]);
