@@ -79,7 +79,11 @@ struct kbase_ioctl_job_submit {
     _IOW(KBASE_IOCTL_TYPE, 2, struct kbase_ioctl_job_submit)
 
 typedef uint32_t base_jd_core_req;
-#define BASE_JD_REQ_CS  ((base_jd_core_req)1 << 1)
+#define BASE_JD_REQ_CS                 ((base_jd_core_req)1 << 1)
+#define BASE_JD_REQ_EXTERNAL_RESOURCES ((base_jd_core_req)1 << 8)
+
+struct base_external_resource { uint64_t ext_resource; };
+#define BASE_EXT_RES_ACCESS_EXCLUSIVE  1u
 
 typedef uint8_t base_atom_id;
 typedef uint8_t base_jd_dep_type;
@@ -118,6 +122,27 @@ static const size_t OFF_DESC_SRC  = 0xf0;
  * 0 = не подменять соответствующий base. */
 __attribute__((visibility("default"))) volatile uint64_t mali_patch_src = 0;
 __attribute__((visibility("default"))) volatile uint64_t mali_patch_dst = 0;
+
+/* ------------------------------------------------------------------ */
+/*  TLS extres buffer — один слот на атом в одном JOB_SUBMIT           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Количество атомов в одном JOB_SUBMIT, для которых мы инжектируем
+ * external resources. Практически всегда = 1.
+ */
+#define PATCHER_MAX_ATOMS        4
+#define PATCHER_MAX_ORIG_EXTRES  16
+#define PATCHER_MAX_EXTRES       (PATCHER_MAX_ORIG_EXTRES + 2)  /* +dst +src */
+
+/*
+ * Буфер в thread-local хранилище: ioctl() синхронен — ядро делает
+ * copy_from_user(extres_list) до возврата syscall, поэтому буфер
+ * гарантированно жив всё нужное время.
+ */
+static __thread struct base_external_resource
+    tls_extres[PATCHER_MAX_ATOMS][PATCHER_MAX_EXTRES];
+static __thread uint32_t tls_atom_slot;
 
 /* ------------------------------------------------------------------ */
 /*  State                                                               */
@@ -185,8 +210,60 @@ static void patch_one_jc(uint64_t jc_gpu) {
     }
 }
 
+/*
+ * Добавляет dst/src VA как external resources к атому, чтобы kbase
+ * заполнил записи GPU MMU до исполнения атома.
+ *
+ * Для USER_BUFFER-импортов (ленивый GPU-маппинг) это обязательно:
+ * без external resource страницы не пинятся и GPU PTE не ставится,
+ * что даёт TRANSLATION_FAULT. Для SAME_VA-аллокаций вызов безвреден
+ * (маппинг уже есть), но позволяет применять патчер к любому валидному
+ * GPU VA вне зависимости от того, как буфер был аллоцирован.
+ */
+static void inject_extres(base_jd_atom_v2 *a, uint32_t slot) {
+    uint64_t dst = mali_patch_dst;
+    uint64_t src = mali_patch_src;
+    uint32_t n_extra = (dst ? 1u : 0u) + (src ? 1u : 0u);
+    if (!n_extra) return;
+
+    uint32_t n_orig = a->nr_extres;
+    if (n_orig > PATCHER_MAX_ORIG_EXTRES) {
+        plogf("  WARNING: nr_extres=%u > %u, extres injection skipped\n",
+              n_orig, PATCHER_MAX_ORIG_EXTRES);
+        return;
+    }
+
+    struct base_external_resource *buf = tls_extres[slot % PATCHER_MAX_ATOMS];
+
+    /* Сохраняем оригинальный список (если был) */
+    if (n_orig && a->extres_list)
+        memcpy(buf, (const void *)(uintptr_t)a->extres_list,
+               n_orig * sizeof(*buf));
+
+    uint32_t k = n_orig;
+    if (dst) {
+        buf[k].ext_resource = (dst & ~(uint64_t)0xFFF) | BASE_EXT_RES_ACCESS_EXCLUSIVE;
+        plogf("  inject extres[%u] DST 0x%llx\n",
+              k, (unsigned long long)buf[k].ext_resource);
+        k++;
+    }
+    if (src) {
+        buf[k].ext_resource = (src & ~(uint64_t)0xFFF) | BASE_EXT_RES_ACCESS_EXCLUSIVE;
+        plogf("  inject extres[%u] SRC 0x%llx\n",
+              k, (unsigned long long)buf[k].ext_resource);
+        k++;
+    }
+
+    a->extres_list = (uint64_t)(uintptr_t)buf;
+    a->nr_extres   = (uint16_t)(n_orig + n_extra);
+    a->core_req   |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+    plogf("  extres: %u→%u entries, core_req=0x%x\n",
+          n_orig, n_orig + n_extra, a->core_req);
+}
+
 static void maybe_patch(struct kbase_ioctl_job_submit *sub) {
     if (!mali_patch_src && !mali_patch_dst) return;
+    tls_atom_slot = 0;
     for (uint32_t i = 0; i < sub->nr_atoms; i++) {
         base_jd_atom_v2 *a = (base_jd_atom_v2 *)
             ((char *)(uintptr_t)sub->addr + (size_t)i * sub->stride);
@@ -195,6 +272,7 @@ static void maybe_patch(struct kbase_ioctl_job_submit *sub) {
         plogf("[JOB_SUBMIT compute atom=%u jc=0x%llx core_req=0x%x — patching]\n",
               a->atom_number, (unsigned long long)a->jc, a->core_req);
         patch_one_jc(a->jc);
+        inject_extres(a, tls_atom_slot++);
     }
 }
 
