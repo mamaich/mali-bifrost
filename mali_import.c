@@ -15,18 +15,12 @@
  * to wait until the event is readable before calling read() — this avoids
  * touching fd flags that the blob may rely on.
  *
- * Physical-memory import (mali_import_phys) requires a custom kernel UAPI
- * header (mali_intercept_uapi.h).  It is compiled only when
- * -DHAVE_INTERCEPT_UAPI is passed.
+ * Physical-memory import (mali_import_phys) uses the custom kernel UAPI
+ * in mali_intercept_uapi.h (module mali_intercept, IOCTL magic 'M').
  *
  * Build (Android NDK, 32-bit ARM):
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
  *       -Wall -O2 mali_import.c -o mali_import \
- *       -lEGL -lGLESv2 -ldl
- *
- *   # With physical-memory import:
- *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
- *       -Wall -O2 -DHAVE_INTERCEPT_UAPI mali_import.c -o mali_import \
  *       -lEGL -lGLESv2 -ldl
  *
  * Run:
@@ -55,9 +49,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#ifdef HAVE_INTERCEPT_UAPI
 #include "mali_intercept_uapi.h"
-#endif
 
 #define PAGE_SHIFT_4K 12
 #define PAGE_SZ_4K    (1u << PAGE_SHIFT_4K)
@@ -458,7 +450,6 @@ static int mali_submit_and_wait(int fd, uint64_t jc_gpu_va, uint64_t target_gpu_
     return ev.event_code == BASE_JD_EVENT_DONE ? 0 : -1;
 }
 
-#ifdef HAVE_INTERCEPT_UAPI
 static int mali_import_phys(int fd, uint64_t phys, uint64_t length,
                              uint64_t *gpu_va_out, size_t *map_size_out)
 {
@@ -483,7 +474,6 @@ static int mali_import_phys(int fd, uint64_t phys, uint64_t length,
     *map_size_out = (size_t)(p.out.va_pages << PAGE_SHIFT_4K);
     return 0;
 }
-#endif /* HAVE_INTERCEPT_UAPI */
 
 /* ------------------------------------------------------------------ */
 /* Static buffer to import into GPU AS                                  */
