@@ -4,12 +4,25 @@
  * LD_PRELOAD shim, который перехватывает kbase JOB_SUBMIT для compute-job'а,
  * собранного proprietary libGLES_mali.so из шейдера mali_hello_compute, и
  * подменяет в Compute Job descriptor (jc) base-адреса SSBO src/dst на
- * GPU VA, заданные через env. Шейдер при этом начинает читать из чужого
- * GPU VA и/или писать в чужой — то, что хотелось «без буферов и без шейдера
- * руками».
+ * GPU VA, которые приложение публикует в наши глобалы. Шейдер при этом
+ * начинает читать из чужого GPU VA и/или писать в чужой — то, что хотелось
+ * «без буферов и без шейдера руками».
  *
- * Раскладка JC (зафиксирована наблюдением v3 на Mali-G31, kbase UK 11.21,
- * шейдер `dst[i] = src[i]` с двумя SSBO по 1024 uint32):
+ * Передача целевых VA из приложения
+ * ---------------------------------
+ * Патчер ЭКСПОРТИРУЕТ две глобальные переменные:
+ *
+ *     volatile uint64_t mali_patch_src;   // GPU VA для SSBO binding=0
+ *     volatile uint64_t mali_patch_dst;   // GPU VA для SSBO binding=1
+ *
+ * Приложение (mali_hello_compute) находит их через
+ * dlsym(RTLD_DEFAULT, "mali_patch_src"/"mali_patch_dst") и пишет туда
+ * нужные адреса ПЕРЕД glDispatchCompute. Значение 0 = «не подменять».
+ * Если патчер не загружен — dlsym вернёт NULL, и приложение поймёт, что
+ * идёт «контрольный» прогон без подмены.
+ *
+ * Раскладка JC (зафиксирована наблюдением observer'ом на Mali-G31,
+ * kbase UK 11.21, шейдер `dst[i] = src[i]` с двумя SSBO по 1024 uint32):
  *
  *   jc + 0xc0 .. 0xc7   FAU mirror: dst base
  *   jc + 0xc8 .. 0xcf   FAU mirror: src base
@@ -18,22 +31,17 @@
  *   jc + 0xf0 .. 0xf7   SSBO desc #1: src base
  *   jc + 0xf8 .. 0xfb   SSBO desc #1: size_minus_one  (НЕ трогаем)
  *
- * Раскладка специфична для этого шейдера (порядок biding, число SSBO,
+ * Раскладка специфична для этого шейдера (порядок binding, число SSBO,
  * blob-версия). Под другой шейдер пересоберите наблюдением observer'ом.
  *
  * Env vars:
- *   MALI_PATCH_SRC=<hex_gpu_va>   подменить src (binding=0)
- *   MALI_PATCH_DST=<hex_gpu_va>   подменить dst (binding=1)
- *   MALI_PATCH_LOG=<path>         лог (по умолчанию stderr)
+ *   MALI_PATCH_LOG=<path>   лог (по умолчанию stderr)
  *
  * Замечания:
  *   1. Адреса должны быть валидны в текущем GPU AS (т.е. аллоцированы через
  *      тот же FD /dev/mali0). Иначе шейдер фолтит на TRANSLATION_FAULT.
  *   2. Размер подменяемого буфера должен быть не меньше оригинального
  *      (4 KiB = 1024 uint32). Иначе будет out-of-bounds.
- *   3. Если подменять только src — dst остаётся «своим» (от GLES), и в
- *      hello_compute основной print "dst[i] = …" покажет данные из вашего
- *      нового src. Это самый практичный режим для «прочитать чужой GPU VA».
  *
  * Build (Android NDK, 32-bit):
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
@@ -41,8 +49,7 @@
  *
  * Run:
  *   adb shell "cd /data/local/tmp && \
- *     LD_PRELOAD=./libmali_patcher.so MALI_PATCH_SRC=0x10006b000 \
- *     MALI_PATCH_LOG=patch.log ./mali_hello_compute"
+ *     LD_PRELOAD=./libmali_patcher.so MALI_PATCH_LOG=patch.log ./mali_hello_compute"
  */
 
 #define _GNU_SOURCE
@@ -98,11 +105,19 @@ typedef struct base_jd_atom_v2 {
 /*  JC offset map for `dst[i] = src[i]` shader (2 SSBO, 1024 uint32)    */
 /* ------------------------------------------------------------------ */
 
-/* Where each base lives in the JC. Из наблюдения. */
 static const size_t OFF_FAU_DST   = 0xc0;
 static const size_t OFF_FAU_SRC   = 0xc8;
 static const size_t OFF_DESC_DST  = 0xe0;
 static const size_t OFF_DESC_SRC  = 0xf0;
+
+/* ------------------------------------------------------------------ */
+/*  Exported globals — приложение пишет сюда через dlsym(RTLD_DEFAULT)  */
+/* ------------------------------------------------------------------ */
+
+/* default visibility, чтобы dlsym(RTLD_DEFAULT, ...) их находил.
+ * 0 = не подменять соответствующий base. */
+__attribute__((visibility("default"))) volatile uint64_t mali_patch_src = 0;
+__attribute__((visibility("default"))) volatile uint64_t mali_patch_dst = 0;
 
 /* ------------------------------------------------------------------ */
 /*  State                                                               */
@@ -112,28 +127,12 @@ static int (*real_ioctl)(int, int, ...) = NULL;
 static FILE *g_log = NULL;
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-static int      g_have_src = 0;
-static uint64_t g_patch_src = 0;
-static int      g_have_dst = 0;
-static uint64_t g_patch_dst = 0;
-
 static void plogf(const char *fmt, ...) {
     pthread_mutex_lock(&g_log_mtx);
     va_list ap; va_start(ap, fmt);
     vfprintf(g_log, fmt, ap);
     va_end(ap);
     pthread_mutex_unlock(&g_log_mtx);
-}
-
-static int parse_u64_env(const char *name, uint64_t *out) {
-    const char *s = getenv(name);
-    if (!s || !*s) return 0;
-    char *end = NULL;
-    errno = 0;
-    unsigned long long v = strtoull(s, &end, 0);
-    if (errno || end == s) return 0;
-    *out = (uint64_t)v;
-    return 1;
 }
 
 __attribute__((constructor))
@@ -147,19 +146,9 @@ static void patcher_init(void) {
         g_log = stderr;
     }
     setvbuf(g_log, NULL, _IONBF, 0);
-
-    g_have_src = parse_u64_env("MALI_PATCH_SRC", &g_patch_src);
-    g_have_dst = parse_u64_env("MALI_PATCH_DST", &g_patch_dst);
-
     fprintf(g_log, "=== mali_compute_patcher attached pid=%d\n", getpid());
-    if (g_have_src)
-        fprintf(g_log, "    MALI_PATCH_SRC = 0x%llx\n",
-                (unsigned long long)g_patch_src);
-    if (g_have_dst)
-        fprintf(g_log, "    MALI_PATCH_DST = 0x%llx\n",
-                (unsigned long long)g_patch_dst);
-    if (!g_have_src && !g_have_dst)
-        fprintf(g_log, "    (no patches set — running passthrough)\n");
+    fprintf(g_log, "    waiting for app to publish mali_patch_src/dst "
+                   "(0 = passthrough)\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,30 +160,33 @@ static void patch_one_jc(uint64_t jc_gpu) {
     volatile uint64_t *jc = (volatile uint64_t *)(uintptr_t)jc_gpu;
     if (!jc) return;
 
-    if (g_have_dst) {
+    uint64_t dst = mali_patch_dst;
+    uint64_t src = mali_patch_src;
+
+    if (dst) {
         uint64_t old1 = jc[OFF_FAU_DST  / 8];
         uint64_t old2 = jc[OFF_DESC_DST / 8];
-        jc[OFF_FAU_DST  / 8] = g_patch_dst;
-        jc[OFF_DESC_DST / 8] = g_patch_dst;
+        jc[OFF_FAU_DST  / 8] = dst;
+        jc[OFF_DESC_DST / 8] = dst;
         plogf("  patch DST jc+0x%02zx: 0x%llx → 0x%llx\n", OFF_FAU_DST,
-              (unsigned long long)old1, (unsigned long long)g_patch_dst);
+              (unsigned long long)old1, (unsigned long long)dst);
         plogf("  patch DST jc+0x%02zx: 0x%llx → 0x%llx\n", OFF_DESC_DST,
-              (unsigned long long)old2, (unsigned long long)g_patch_dst);
+              (unsigned long long)old2, (unsigned long long)dst);
     }
-    if (g_have_src) {
+    if (src) {
         uint64_t old1 = jc[OFF_FAU_SRC  / 8];
         uint64_t old2 = jc[OFF_DESC_SRC / 8];
-        jc[OFF_FAU_SRC  / 8] = g_patch_src;
-        jc[OFF_DESC_SRC / 8] = g_patch_src;
+        jc[OFF_FAU_SRC  / 8] = src;
+        jc[OFF_DESC_SRC / 8] = src;
         plogf("  patch SRC jc+0x%02zx: 0x%llx → 0x%llx\n", OFF_FAU_SRC,
-              (unsigned long long)old1, (unsigned long long)g_patch_src);
+              (unsigned long long)old1, (unsigned long long)src);
         plogf("  patch SRC jc+0x%02zx: 0x%llx → 0x%llx\n", OFF_DESC_SRC,
-              (unsigned long long)old2, (unsigned long long)g_patch_src);
+              (unsigned long long)old2, (unsigned long long)src);
     }
 }
 
 static void maybe_patch(struct kbase_ioctl_job_submit *sub) {
-    if (!g_have_src && !g_have_dst) return;
+    if (!mali_patch_src && !mali_patch_dst) return;
     for (uint32_t i = 0; i < sub->nr_atoms; i++) {
         base_jd_atom_v2 *a = (base_jd_atom_v2 *)
             ((char *)(uintptr_t)sub->addr + (size_t)i * sub->stride);

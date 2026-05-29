@@ -19,12 +19,12 @@
  *   # но 32-bit Android, поэтому нет /system/bin/linker64):
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang \
  *       -Wall -O2 mali_hello_compute.c -o mali_hello_compute \
- *       -lEGL -lGLESv2
+ *       -lEGL -lGLESv2 -ldl
  *
  *   # 64-bit ARM userspace (если на устройстве есть /system/bin/linker64):
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
  *       -Wall -O2 mali_hello_compute.c -o mali_hello_compute \
- *       -lEGL -lGLESv2
+ *       -lEGL -lGLESv2 -ldl
  *
  * Линкуем -lGLESv2 (а не -lGLESv3) — libGLESv2.so на Android содержит
  * все ES 3.x символы, отдельной libGLESv3.so на устройстве обычно нет.
@@ -34,11 +34,13 @@
  *   adb shell "cd /data/local/tmp && ./mali_hello_compute"
  */
 
+#define _GNU_SOURCE
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -124,6 +126,37 @@ static int find_mali_fd(void) {
     return found;
 }
 
+/* Целевые GPU VA, которые мы хотим подсунуть compute-шейдеру вместо
+ * «родных» SSBO, выделенных GLES.
+ *
+ * ВНИМАНИЕ: это ЗАГЛУШКИ. Чтобы GPU реально прочитал/записал эти адреса
+ * без TRANSLATION_FAULT, замените их на VA, валидные в текущем GPU AS
+ * (например, выделенные своим MEM_ALLOC через тот же /dev/mali0 fd).
+ * 0 = не подменять соответствующий SSBO. */
+uint64_t g_target_src = 0x5000000ULL;   /* SSBO binding=0 (src) */
+uint64_t g_target_dst = 0x5100000ULL;   /* SSBO binding=1 (dst) */
+
+/* Опубликовать целевые VA в патчер (libmali_patcher.so), если он загружен
+ * через LD_PRELOAD. Патчер экспортирует глобалы mali_patch_src/mali_patch_dst;
+ * находим их через dlsym(RTLD_DEFAULT, ...) и пишем туда наши значения ДО
+ * glDispatchCompute. Если dlsym вернул NULL — патчер не подключён, идёт
+ * обычный «контрольный» прогон без подмены. */
+static void publish_targets_to_patcher(void) {
+    uint64_t *psrc = (uint64_t *)dlsym(RTLD_DEFAULT, "mali_patch_src");
+    uint64_t *pdst = (uint64_t *)dlsym(RTLD_DEFAULT, "mali_patch_dst");
+    if (psrc && pdst) {
+        *psrc = g_target_src;
+        *pdst = g_target_dst;
+        printf("patcher detected: published src=0x%llx dst=0x%llx\n",
+               (unsigned long long)g_target_src,
+               (unsigned long long)g_target_dst);
+        printf("  (NB: заглушечные VA вызовут GPU fault, пока не замените "
+               "на валидные в этом AS)\n");
+    } else {
+        printf("patcher NOT loaded (mali_patch_* not found) — unmodified run\n");
+    }
+}
+
 int main(void) {
     /* ------------------------- EGL/GLES setup --------------------------- */
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -191,6 +224,11 @@ int main(void) {
     /* ------------------------- Build + dispatch ------------------------- */
     GLuint prog = build_program();
     glUseProgram(prog);
+
+    /* Передать целевые GPU VA патчеру (если он в LD_PRELOAD) ДО submit'а:
+     * глобалы должны быть установлены к моменту, когда blob сформирует и
+     * подаст compute-job в glDispatchCompute/glFinish. */
+    publish_targets_to_patcher();
 
     /* 4 KiB / 4 = 1024 work items, local_size_x=64 -> 16 workgroups */
     fprintf(stderr, "dispatching: %u work items in %u groups\n",
